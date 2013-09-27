@@ -18146,10 +18146,10 @@ index 0000000..f0f5218
 +		return -ENODEV;
 +	}
 +
-+	if (!IS_HSW(vgt->pdev)) {
-+		vgt_err("Only HSW is supported now\n");
-+		return -EINVAL;
-+	}
++	//if (!IS_HSW(vgt->pdev)) {
++	//	vgt_err("Only HSW is supported now\n");
++	//	return -EINVAL;
++	//}
 +	for (i = 0; i < MAX_INTEL_PIPES; i++) {
 +		struct vgt_pipe_format *pipe = &fb->pipes[i];
 +
@@ -27806,8 +27806,8 @@ index 0000000..5ed076c
 +	int i;
 +	vgt_reg_t	ccid;
 +
-+	if (!IS_HSW(pdev))
-+		return false;
++	//if (!IS_HSW(pdev))
++	//	return false;
 +
 +	/* only RCS support HW context on HSW */
 +	if ((id != RING_BUFFER_RCS) || ring->null_context)

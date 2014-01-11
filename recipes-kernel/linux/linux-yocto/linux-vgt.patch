@@ -1,16 +1,3 @@
-diff --git a/Makefile b/Makefile
-index a01c032..4d30725 100644
---- a/Makefile
-+++ b/Makefile
-@@ -1,7 +1,7 @@
- VERSION = 3
- PATCHLEVEL = 8
- SUBLEVEL = 13
--EXTRAVERSION = .4
-+EXTRAVERSION = .4-vgt
- NAME = Remoralised Urchins Update
- 
- # *DOCUMENTATION*
 diff --git a/XenGT-API.txt b/XenGT-API.txt
 new file mode 100644
 index 0000000..e552144

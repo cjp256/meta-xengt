@@ -1,0 +1,20 @@
+--- a/tools/qemu-xen/hw/ps2.c	2011-11-15 11:43:39.000000000 +0100
++++ b/tools/qemu-xen/hw/ps2.c	2011-11-15 11:44:26.000000000 +0100
+@@ -70,7 +70,7 @@
+ #define MOUSE_STATUS_ENABLED    0x20
+ #define MOUSE_STATUS_SCALE21    0x10
+ 
+-#define PS2_QUEUE_SIZE 256
++#define PS2_QUEUE_SIZE 15
+ 
+ typedef struct {
+     uint8_t data[PS2_QUEUE_SIZE];
+@@ -362,7 +362,7 @@
+     s->mouse_buttons = buttons_state;
+ 
+     if (!(s->mouse_status & MOUSE_STATUS_REMOTE) &&
+-        (s->common.queue.count < (PS2_QUEUE_SIZE - 16))) {
++        (s->common.queue.count < (PS2_QUEUE_SIZE - 8))) {
+         for(;;) {
+             /* if not remote, send event. Multiple events are sent if
+                too big deltas */

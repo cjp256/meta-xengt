@@ -1,0 +1,4162 @@
+diff --git a/tools/qemu-xen/.gitignore b/tools/qemu-xen/.gitignore
+index bd6ba1c..4a94dd3 100644
+--- a/tools/qemu-xen/.gitignore
++++ b/tools/qemu-xen/.gitignore
+@@ -50,6 +50,7 @@ test-visitor-serialization
+ fsdev/virtfs-proxy-helper.1
+ fsdev/virtfs-proxy-helper.pod
+ .gdbinit
++qips/qips
+ *.a
+ *.aux
+ *.cp
+diff --git a/tools/qemu-xen/Makefile b/tools/qemu-xen/Makefile
+index 9ecbcbb..5ba0c4d 100644
+--- a/tools/qemu-xen/Makefile
++++ b/tools/qemu-xen/Makefile
+@@ -195,6 +195,8 @@ qemu-img$(EXESUF): qemu-img.o $(tools-obj-y) $(block-obj-y) libqemustub.a
+ qemu-nbd$(EXESUF): qemu-nbd.o $(tools-obj-y) $(block-obj-y) libqemustub.a
+ qemu-io$(EXESUF): qemu-io.o cmd.o $(tools-obj-y) $(block-obj-y) libqemustub.a
+ 
++qips/qips$(EXESUF): $(qips-obj-y) json-streamer.o json-parser.o json-lexer.o error.o qlist.o qjson.o qint.o qstring.o qbool.o qfloat.o qdict.o ui/x_keymap.o qemu-thread-posix.o cutils.o
++
+ qemu-bridge-helper$(EXESUF): qemu-bridge-helper.o
+ 
+ vscclient$(EXESUF): $(libcacard-y) $(oslib-obj-y) $(trace-obj-y) libcacard/vscclient.o libqemustub.a
+diff --git a/tools/qemu-xen/Makefile.objs b/tools/qemu-xen/Makefile.objs
+index 3c7abca..46edc7c 100644
+--- a/tools/qemu-xen/Makefile.objs
++++ b/tools/qemu-xen/Makefile.objs
+@@ -106,6 +106,8 @@ common-obj-$(CONFIG_SLIRP) += slirp/
+ 
+ common-obj-y += backends/
+ 
++qips-obj-$(CONFIG_QIPS) += qips/
++
+ ######################################################################
+ # libseccomp
+ ifeq ($(CONFIG_SECCOMP),y)
+@@ -250,5 +252,6 @@ nested-vars += \
+ 	block-obj-y \
+ 	user-obj-y \
+ 	common-obj-y \
+-	extra-obj-y
++	extra-obj-y \
++	qips-obj-y
+ dummy := $(call unnest-vars)
+diff --git a/tools/qemu-xen/configure b/tools/qemu-xen/configure
+index 994f731..7675a43 100755
+--- a/tools/qemu-xen/configure
++++ b/tools/qemu-xen/configure
+@@ -223,6 +223,7 @@ libiscsi=""
+ coroutine=""
+ seccomp=""
+ glusterfs=""
++qips="yes"
+ 
+ # parse CC options first
+ for opt do
+@@ -871,6 +872,10 @@ for opt do
+   ;;
+   --enable-glusterfs) glusterfs="yes"
+   ;;
++  --enable-qips) qips="yes"
++  ;;
++  --disable-qips) qips="no"
++  ;;
+   *) echo "ERROR: unknown option $opt"; show_help="yes"
+   ;;
+   esac
+@@ -1119,6 +1124,8 @@ echo "  --with-coroutine=BACKEND coroutine backend. Supported options:"
+ echo "                           gthread, ucontext, sigaltstack, windows"
+ echo "  --enable-glusterfs       enable GlusterFS backend"
+ echo "  --disable-glusterfs      disable GlusterFS backend"
++echo "  --enable-qips             enable QIPS support"
++echo "  --disable-qips            enable QIPS support"
+ echo ""
+ echo "NOTE: The object files are built at the place where configure is launched"
+ exit 1
+@@ -3250,6 +3257,7 @@ echo "build guest agent $guest_agent"
+ echo "seccomp support   $seccomp"
+ echo "coroutine backend $coroutine_backend"
+ echo "GlusterFS support $glusterfs"
++echo "QIPS support      $qips"
+ 
+ if test "$sdl_too_old" = "yes"; then
+ echo "-> Your SDL version is too old - please upgrade to have SDL support"
+@@ -3609,6 +3617,15 @@ bsd)
+ ;;
+ esac
+ 
++# QIPS support
++if test "$qips" = "yes"; then
++    tools="qips/qips\$(EXESUF) $tools"
++  echo "CONFIG_QIPS=y" >> $config_host_mak
++  echo "CONFIG_QIPS_EVDEV=y" >> $config_host_mak
++else
++  echo "CONFIG_QIPS=n" >> $config_host_mak
++fi
++
+ # use default implementation for tracing backend-specific routines
+ trace_default=yes
+ echo "TRACE_BACKEND=$trace_backend" >> $config_host_mak
+diff --git a/tools/qemu-xen/monitor.c b/tools/qemu-xen/monitor.c
+index c0e32d6..dcb04d1 100644
+--- a/tools/qemu-xen/monitor.c
++++ b/tools/qemu-xen/monitor.c
+@@ -458,6 +458,9 @@ static const char *monitor_event_names[] = {
+     [QEVENT_WAKEUP] = "WAKEUP",
+     [QEVENT_BALLOON_CHANGE] = "BALLOON_CHANGE",
+     [QEVENT_SPICE_MIGRATE_COMPLETED] = "SPICE_MIGRATE_COMPLETED",
++    [QEVENT_QIP_MOUSE_MODE_UPDATE] = "QEVENT_QIP_MOUSE_MODE_UPDATE",
++    [QEVENT_QIP_DISPLAY_MODE_UPDATE] = "QEVENT_QIP_DISPLAY_MODE_UPDATE",
++    [QEVENT_QIP_KBD_LEDS_UPDATE] = "QEVENT_QIP_KBD_LEDS_UPDATE",
+ };
+ QEMU_BUILD_BUG_ON(ARRAY_SIZE(monitor_event_names) != QEVENT_MAX)
+ 
+diff --git a/tools/qemu-xen/monitor.h b/tools/qemu-xen/monitor.h
+index b4ef955..b1a9b77 100644
+--- a/tools/qemu-xen/monitor.h
++++ b/tools/qemu-xen/monitor.h
+@@ -46,6 +46,9 @@ typedef enum MonitorEvent {
+     QEVENT_WAKEUP,
+     QEVENT_BALLOON_CHANGE,
+     QEVENT_SPICE_MIGRATE_COMPLETED,
++    QEVENT_QIP_MOUSE_MODE_UPDATE,
++    QEVENT_QIP_DISPLAY_MODE_UPDATE,
++    QEVENT_QIP_KBD_LEDS_UPDATE,
+ 
+     /* Add to 'monitor_event_names' array in monitor.c when
+      * defining new events here */
+diff --git a/tools/qemu-xen/qapi-schema.json b/tools/qemu-xen/qapi-schema.json
+index 5dfa052..dce7f2b 100644
+--- a/tools/qemu-xen/qapi-schema.json
++++ b/tools/qemu-xen/qapi-schema.json
+@@ -3017,3 +3017,187 @@
+ # Since: 1.3.0
+ ##
+ { 'command': 'nbd-server-stop' }
++
++##
++# @send-keycode:
++#
++# Send keycode to VM.
++#
++# @keycode: keycode
++# @released: key released
++#
++# Returns: Nothing on success
++#
++# Since: 1.3.0
++##
++{ 'command': 'send-keycode', 'data': {'keycode': 'int', 'released': 'bool'} }
++
++##
++# @MouseButtons:
++#
++# Mouse buttons.
++#
++# @left: left mouse button on/off
++#
++# @middle: middle mouse button on/off
++#
++# @right: right mouse button on/off
++#
++# Since: 1.3.0
++##
++{ 'type': 'MouseButtons',
++  'data': { 'left': 'bool', 'middle': 'bool', 'right': 'bool' } }
++
++##
++# @send-mouse-abs:
++#
++# Send relative mouse coordinates.
++#
++# @x: absolute x coord
++# @y: absolute y coord
++# @z: absolute z coord
++# @buttons: mouse button state
++#
++# Returns: Nothing on success
++#
++# Since: 1.3.0
++##
++{ 'command': 'send-mouse-abs',
++  'data': {'x': 'int', 'y': 'int', 'z': 'int', 'buttons': 'MouseButtons'} }
++
++##
++# @send-mouse-rel:
++#
++# Send relative mouse coordinates.
++#
++# @dx: delta x
++# @dy: delta y
++# @dz: delta z
++# @buttons: mouse button state
++#
++# Returns: Nothing on success
++#
++# Since: 1.3.0
++##
++{ 'command': 'send-mouse-rel',
++  'data': {'dx': 'int', 'dy': 'int', 'dz': 'int', 'buttons': 'MouseButtons'} }
++
++##
++# @send-display-size:
++#
++# Send relative mouse coordinates.
++#
++# @x: width
++# @y: height
++#
++# Returns: Nothing on success
++#
++# Since: 1.3.0
++##
++{ 'command': 'send-display-size',
++  'data': {'x': 'int', 'y': 'int'} }
++
++##
++# @send-mouse-scale:
++#
++# Send scaler for qips mouse input.
++#
++# @x: width multiplier
++# @y: height multiplier
++#
++# Returns: Nothing on success
++#
++# Since: 1.3.0
++##
++{ 'command': 'send-mouse-scale',
++  'data': {'x': 'number', 'y': 'number'} }
++
++##
++# @send-kbd-reset:
++#
++# Reset all downed keys up.
++#
++# Returns: Nothing on success
++#
++# Since: 1.3.0
++##
++{ 'command': 'send-kbd-reset' }
++
++##
++# @KbdLedStatus:
++#
++# Information describing a machine.
++#
++# @caps: caps lock on/off
++#
++# @scroll: scroll lock on/off
++#
++# @num: num lock on/off
++#
++# Since: 1.3.0
++##
++{ 'type': 'KbdLedStatus',
++  'data': { 'caps': 'bool', 'scroll': 'bool', 'num': 'bool' } }
++
++##
++# @query-kbd-leds:
++#
++# Query LED state.
++#
++# Returns: KbdLedStatus
++#
++# Since: 1.3.0
++##
++{ 'command': 'query-kbd-leds', 'returns': 'KbdLedStatus' }
++
++##
++# @MouseStatus:
++#
++# Information describing the mouse.
++#
++# @absolute: absolute positioning on/off
++#
++# @x: x coord if absolute
++#
++# @y: y coord if absolute
++#
++# Since: 1.3.0
++##
++{ 'type': 'MouseStatus',
++  'data': { 'absolute': 'bool', 'x': 'int', 'y': 'int' } }
++
++##
++# @query-mouse-status:
++#
++# Query if mouse mode is absolute positioning.
++#
++# Returns: absolute mode boolean
++#
++# Since: 1.3.0
++##
++{ 'command': 'query-mouse-status', 'returns': 'MouseStatus' }
++
++##
++# @XenStatus:
++#
++# Xen bits
++#
++# @xen: xen domain true/off
++#
++# @domain: xen domain id
++#
++# Since: 1.3.0
++##
++{ 'type': 'XenStatus',
++  'data': { 'xen': 'bool', 'domain': 'int' } }
++
++##
++# @query-xen-status:
++#
++# Query xen related state.
++#
++# Returns: int
++#
++# Since: 1.3.0
++##
++{ 'command': 'query-xen-status', 'returns': 'XenStatus' }
+diff --git a/tools/qemu-xen/qemu-options.hx b/tools/qemu-xen/qemu-options.hx
+index de43b1b..1efffe5 100644
+--- a/tools/qemu-xen/qemu-options.hx
++++ b/tools/qemu-xen/qemu-options.hx
+@@ -2941,6 +2941,23 @@ DEF("object", HAS_ARG, QEMU_OPTION_object,
+     "                '/objects' path.\n",
+     QEMU_ARCH_ALL)
+ 
++DEF("qip", HAS_ARG, QEMU_OPTION_qip,
++    "-qip debug=<nr>\n"
++    "   enable input protocol plugin\n",
++    QEMU_ARCH_ALL)
++STEXI
++@item -qip @var{option}[,@var{option}[,...]]
++@findex -qip
++Enable the input protocol plugin. Valid options are
++
++@table @option
++
++@item debug=<nr>
++Set the debug level.
++
++@end table
++ETEXI
++
+ HXCOMM This is the last statement. Insert new options before this line!
+ STEXI
+ @end table
+diff --git a/tools/qemu-xen/qips/Makefile.objs b/tools/qemu-xen/qips/Makefile.objs
+new file mode 100644
+index 0000000..c99ec48
+--- /dev/null
++++ b/tools/qemu-xen/qips/Makefile.objs
+@@ -0,0 +1,4 @@
++qips-obj-y += qips.o
++qips-obj-y += console-frontend/
++qips-obj-y += console-backend/
++qips-obj-y += input-backend/
+diff --git a/tools/qemu-xen/qips/console-backend/Makefile.objs b/tools/qemu-xen/qips/console-backend/Makefile.objs
+new file mode 100644
+index 0000000..1b265d5
+--- /dev/null
++++ b/tools/qemu-xen/qips/console-backend/Makefile.objs
+@@ -0,0 +1,2 @@
++qips-obj-y += console-backend.o
++qips-obj-y += vt.o
+diff --git a/tools/qemu-xen/qips/console-backend/console-backend.c b/tools/qemu-xen/qips/console-backend/console-backend.c
+new file mode 100644
+index 0000000..5a3451e
+--- /dev/null
++++ b/tools/qemu-xen/qips/console-backend/console-backend.c
+@@ -0,0 +1,83 @@
++/*
++ * Copyright (c) 2013 Chris Patterson <cjp256@gmail.com>
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
++ *
++ */
++
++#include "console-backend.h"
++
++static const QipsConsoleBackend *console_backend = NULL;
++
++void qips_console_backend_register(const QipsConsoleBackend * backend)
++{
++    console_backend = backend;
++}
++
++bool qips_console_backend_init(void)
++{
++    return console_backend->init();
++}
++
++bool qips_console_backend_lock(void)
++{
++    return console_backend->lock();
++}
++
++int qips_console_backend_get_ledstate(void)
++{
++    int state = console_backend->get_ledstate();
++
++    if (state & QEMU_SCROLL_LOCK_LED) {
++        DPRINTF("scroll lock led is set...\n");
++    }
++
++    if (state & QEMU_NUM_LOCK_LED) {
++        DPRINTF("num lock led is set...\n");
++    }
++
++    if (state & QEMU_CAPS_LOCK_LED) {
++        DPRINTF("caps lock led is set...\n");
++    }
++
++    return state;
++}
++
++bool qips_console_backend_set_ledstate(int state)
++{
++    if (state & QEMU_SCROLL_LOCK_LED) {
++        DPRINTF("setting scroll lock led...\n");
++    }
++
++    if (state & QEMU_NUM_LOCK_LED) {
++        DPRINTF("setting num lock led...\n");
++    }
++
++    if (state & QEMU_CAPS_LOCK_LED) {
++        DPRINTF("setting caps lock led...\n");
++    }
++
++    return console_backend->set_ledstate(state);
++}
++
++bool qips_console_backend_release(void)
++{
++    return console_backend->release();
++}
++
++bool qips_console_backend_cleanup(void)
++{
++    return console_backend->cleanup();
++}
+diff --git a/tools/qemu-xen/qips/console-backend/console-backend.h b/tools/qemu-xen/qips/console-backend/console-backend.h
+new file mode 100644
+index 0000000..345b526
+--- /dev/null
++++ b/tools/qemu-xen/qips/console-backend/console-backend.h
+@@ -0,0 +1,52 @@
++/*
++ * Copyright (c) 2013 Chris Patterson <cjp256@gmail.com>
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
++ *
++ */
++
++#ifndef QIPS_CONSOLE_BACKEND_H
++#define QIPS_CONSOLE_BACKEND_H
++
++#include <stdbool.h>
++#include <stdio.h>
++
++#include "qips/qips.h"
++#include "console.h"
++
++typedef struct {
++    bool(*init) (void);
++    bool(*lock) (void);
++    bool(*release) (void);
++    int (*get_ledstate) (void);
++     bool(*set_ledstate) (int);
++     bool(*cleanup) (void);
++} QipsConsoleBackend;
++
++void qips_console_backend_register(const QipsConsoleBackend * backend);
++
++bool qips_console_backend_init(void);
++
++bool qips_console_backend_lock(void);
++
++bool qips_console_backend_release(void);
++
++int qips_console_backend_get_ledstate(void);
++
++bool qips_console_backend_set_ledstate(int);
++
++bool qips_console_backend_cleanup(void);
++
++#endif
+diff --git a/tools/qemu-xen/qips/console-backend/vt.c b/tools/qemu-xen/qips/console-backend/vt.c
+new file mode 100644
+index 0000000..e36514b
+--- /dev/null
++++ b/tools/qemu-xen/qips/console-backend/vt.c
+@@ -0,0 +1,436 @@
++/*
++ * Copyright (c) 2013 Chris Patterson <cjp256@gmail.com>
++ *
++ * With bits adapted/referenced from kbd/src/vlock/vt.c:
++ * Copyright (C) 1994-1998  Michael K. Johnson <johnsonm@redhat.com>
++ * Copyright (C) 2002, 2004, 2005  Dmitry V. Levin <ldv@altlinux.org>
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
++ *
++ */
++
++#include <stdio.h>
++#include <stdint.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++#include <fcntl.h>
++#include <sys/ioctl.h>
++#include <errno.h>
++#include <signal.h>
++#include <sys/vt.h>
++#include <sys/kd.h>
++#include <termios.h>
++
++#include "console-backend.h"
++#include "vt.h"
++
++#define VT_DEFAULT_TARGET_TTY "/dev/tty9"
++
++static const char *vt_target_tty = VT_DEFAULT_TARGET_TTY;
++
++/* data saved for lock & unlock/restore */
++static struct termios vt_term_saved;
++static struct vt_mode vt_mode_saved;
++static struct sigaction vt_sigusr1_handler_saved;
++static struct sigaction vt_sigusr2_handler_saved;
++static int tty_index = 9;
++static int tty_index_save = 1;
++
++/* Is console switching currently disabled? */
++static bool console_locked = false;
++
++/* save current settings & lock terminal */
++static void termios_lock(void)
++{
++    struct termios term_locked;
++
++    /* save current termios settings */
++    tcgetattr(STDIN_FILENO, &vt_term_saved);
++    memcpy(&term_locked, &vt_term_saved, sizeof(term_locked));
++
++    /* disable echoing and character command signals */
++    term_locked.c_lflag &= ~(ECHO | ISIG);
++    tcsetattr(STDIN_FILENO, TCSANOW, &term_locked);
++}
++
++/* restore terminal */
++static void termios_restore(void)
++{
++    tcsetattr(STDIN_FILENO, TCSANOW, &vt_term_saved);
++}
++
++/* acknowledge signal & deny vt switch */
++static void vt_console_switch_away_deny(int __attribute__ ((__unused__)) n)
++{
++    ioctl(STDIN_FILENO, VT_RELDISP, 0);
++}
++
++/* acknowledge signal & allow vt switch */
++static void vt_console_switch_to_allow(int __attribute__ ((__unused__)) n)
++{
++    ioctl(STDIN_FILENO, VT_RELDISP, VT_ACKACQ);
++}
++
++/* update vt to prevent vt switching */
++static bool vt_console_lock(void)
++{
++    struct vt_stat vt_stat;
++    struct vt_mode vt_mode_locked;
++    struct sigaction sa;
++    sigset_t sig;
++
++    DPRINTF("entry\n");
++
++    /* backup current console mode */
++    if (ioctl(STDIN_FILENO, VT_GETMODE, &vt_mode_saved) < 0) {
++        perror("VT_GETMODE failed");
++        return false;
++    }
++
++    /* remember user vt index */
++    if (ioctl(STDIN_FILENO, VT_GETSTATE, &vt_stat) < 0) {
++        perror("VT_GETSTATE failed");
++        return false;
++    }
++
++    DPRINTF("v_active=%d\n", (int)vt_stat.v_active);
++    DPRINTF("v_state=0x%x\n", (int)vt_stat.v_state);
++    DPRINTF("v_signal=0x%x\n", (int)vt_stat.v_signal);
++
++    tty_index_save = vt_stat.v_active;
++
++    DPRINTF("remembering term=%d\n", tty_index_save);
++
++    /* switch to qemu-iss console */
++    if (ioctl(STDIN_FILENO, VT_ACTIVATE, tty_index) < 0) {
++        perror("VT_ACTIVATE failed");
++        return false;
++    }
++
++    if (ioctl(STDIN_FILENO, VT_WAITACTIVE, tty_index) < 0) {
++        perror("VT_WAITACTIVE failed");
++        return false;
++    }
++
++    /* copy current console mode for modification */
++    memcpy(&vt_mode_locked, &vt_mode_saved, sizeof(vt_mode_locked));
++
++    sigemptyset(&(sa.sa_mask));
++    sa.sa_flags = SA_RESTART;
++
++    /* set SIGUSR1 to handle vt release events which need to be denied */
++    sa.sa_handler = vt_console_switch_away_deny;
++    sigaction(SIGUSR1, &sa, &vt_sigusr1_handler_saved);
++    vt_mode_locked.relsig = SIGUSR1;
++
++    /* set SIGUSR2 to handle vt acquire events which should be allowed */
++    sa.sa_handler = vt_console_switch_to_allow;
++    sigaction(SIGUSR2, &sa, &vt_sigusr2_handler_saved);
++    vt_mode_locked.acqsig = SIGUSR2;
++
++    /* allow SIGUSR1 & SIGUSR2 signals */
++    sigemptyset(&sig);
++    sigaddset(&sig, SIGUSR1);
++    sigaddset(&sig, SIGUSR2);
++    sigprocmask(SIG_UNBLOCK, &sig, 0);
++
++    /* we be in charge of vt handling */
++    vt_mode_locked.mode = VT_PROCESS;
++
++    /* just do it. */
++    if (ioctl(STDIN_FILENO, VT_SETMODE, &vt_mode_locked) < 0) {
++        perror("VT_SETMODE failed");
++        return false;
++    }
++
++    return true;
++}
++
++/* restore vt to pre-locked conditions */
++static bool vt_console_restore(void)
++{
++    DPRINTF("entry\n");
++
++    /* restore saved vt mode */
++    if (ioctl(STDIN_FILENO, VT_SETMODE, &vt_mode_saved) < 0) {
++        perror("VT_SETMODE failed");
++        return false;
++    }
++
++    /* restore sigusr1 signal handler */
++    sigaction(SIGUSR1, &vt_sigusr1_handler_saved, NULL);
++
++    /* restore user vt if different than qemu-iss */
++    if (tty_index_save != tty_index) {
++        DPRINTF("switching back to term=%d\n", tty_index_save);
++
++        /* do the switch */
++        if (ioctl(STDIN_FILENO, VT_ACTIVATE, tty_index_save) < 0) {
++            perror("VT_ACTIVATE");
++        }
++
++        /* wait until switch is complete */
++        if (ioctl(STDIN_FILENO, VT_WAITACTIVE, tty_index_save) < 0) {
++            perror("VT_WAITACTIVE");
++        }
++    }
++
++    return true;
++}
++
++static bool vt_init(void)
++{
++    pid_t pid, ppid, pgid, ppgid, ttypgid, sid, psid;
++    int fd;
++
++    DPRINTF("entry\n");
++
++    if ((fd = open(vt_target_tty, O_RDWR | O_NOCTTY)) < 0) {
++        DPRINTF("unable to open tty=%s\n", vt_target_tty);
++        return false;
++    }
++
++    if (!isatty(fd)) {
++        DPRINTF("errr %s not a tty!!??\n", vt_target_tty);
++        close(fd);
++        return false;
++    }
++
++    DPRINTF("valid tty fd=%d\n", fd);
++
++    /* Get current process id */
++    pid = getpid();
++    DPRINTF("pid=%jd\n", (intmax_t) pid);
++
++    /* Get parent process id */
++    ppid = getppid();
++    DPRINTF("ppid=%jd\n", (intmax_t) ppid);
++
++    /* Get current process group id */
++    pgid = getpgid(pid);
++    DPRINTF("pgid=%jd\n", (intmax_t) pgid);
++
++    /* Get parent process group id */
++    ppgid = getpgid(ppid);
++    DPRINTF("ppgid=%jd\n", (intmax_t) ppgid);
++
++    /* Get process group id for tty */
++    ttypgid = tcgetpgrp(fd);
++    DPRINTF("ttypgid=%jd\n", (intmax_t) ttypgid);
++
++    /* Get current session id */
++    sid = getsid(pid);
++    DPRINTF("sid=%jd\n", (intmax_t) sid);
++
++    /* Get parent session id */
++    psid = getsid(ppid);
++    DPRINTF("psid=%jd\n", (intmax_t) psid);
++
++    /*
++     * If self and parent group id matches tty's group id,
++     * we are good to go.
++     */
++    if (ppid == ttypgid || ppgid == ttypgid) {
++        DPRINTF("process id matches tty\n");
++        return true;
++    }
++
++    /* if parent is not init - daemonize */
++    if (ppid != 1) {
++        pid = fork();
++
++        if (pid < 0) {
++            perror("fork failed");
++            exit(-1);
++        }
++
++        /* exit if parent */
++        if (pid > 0) {
++            exit(0);
++        }
++    }
++
++    /*
++     * create a new session if not a process group leader
++     */
++    if (pid != sid) {
++        DPRINTF("creating new session...\n");
++
++        /* set new session */
++        setsid();
++        sid = getsid(pid);
++        DPRINTF("new sid=%jd\n", (intmax_t) sid);
++    }
++
++    /* get the controlling terminal */
++    ioctl(fd, TIOCSCTTY, (char *)1);
++
++    /* we need to reopen all stdio descriptions (in, out, err) under new tty */
++    dup2(fd, STDIN_FILENO);
++    dup2(fd, STDOUT_FILENO);
++    dup2(fd, STDERR_FILENO);
++
++    /* close old tty handle if it is not stdio */
++    if (fd > 2) {
++        DPRINTF("closing fd=%d\n", fd);
++        close(fd);
++    }
++
++    return true;
++}
++
++static bool vt_lock(void)
++{
++    DPRINTF("entry\n");
++
++    if (console_locked) {
++        return true;
++    }
++
++    DPRINTF("locking console...\n");
++    vt_console_lock();
++    termios_lock();
++    console_locked = true;
++
++    return true;
++}
++
++static bool vt_release(void)
++{
++    DPRINTF("entry\n");
++
++    if (console_locked) {
++        DPRINTF("restoring console...\n");
++        vt_console_restore();
++        termios_restore();
++        console_locked = false;
++    }
++
++    return true;
++}
++
++static int vt_get_ledstate(void)
++{
++    int qips_led_state = 0;
++    char kbd_leds = 0;
++
++    DPRINTF("entry\n");
++
++    if (ioctl(0, KDGETLED, &kbd_leds)) {
++        DPRINTF("KDGETLED failure: %s\n", strerror(errno));
++        return 0;
++    }
++
++    DPRINTF("KDGETLED = 0x%x\n", kbd_leds);
++
++    if (kbd_leds & LED_SCR) {
++        qips_led_state |= QEMU_SCROLL_LOCK_LED;
++    }
++
++    if (kbd_leds & LED_NUM) {
++        qips_led_state |= QEMU_NUM_LOCK_LED;
++    }
++
++    if (kbd_leds & LED_CAP) {
++        qips_led_state |= QEMU_CAPS_LOCK_LED;
++    }
++
++    DPRINTF("QEMULED = 0x%x\n", qips_led_state);
++
++    return true;
++}
++
++static bool vt_set_ledstate(int qips_led_state)
++{
++    char kbd_leds = 0;
++
++    DPRINTF("entry\n");
++
++    DPRINTF("QEMULED = 0x%x\n", qips_led_state);
++
++    if (ioctl(0, KDGETLED, &kbd_leds)) {
++        DPRINTF("KDGETLED failure: %s\n", strerror(errno));
++        return 0;
++    }
++
++    DPRINTF("KDGETLED = 0x%x\n", kbd_leds);
++
++    kbd_leds = 0;
++
++    if (qips_led_state & QEMU_SCROLL_LOCK_LED) {
++        kbd_leds |= LED_SCR;
++    }
++
++    if (qips_led_state & QEMU_NUM_LOCK_LED) {
++        kbd_leds |= LED_NUM;
++    }
++
++    if (qips_led_state & QEMU_CAPS_LOCK_LED) {
++        kbd_leds |= LED_CAP;
++    }
++
++    DPRINTF("KDSETLED = 0x%x\n", kbd_leds);
++
++    if (ioctl(0, KDSETLED, kbd_leds)) {
++        DPRINTF("KDSETLED failure: %s\n", strerror(errno));
++        return false;
++    }
++
++    if (ioctl(0, KDGETLED, &kbd_leds)) {
++        DPRINTF("KDGETLED failure: %s\n", strerror(errno));
++        return 0;
++    }
++
++    DPRINTF("KDGETLED after KDSETLED = 0x%x\n", kbd_leds);
++
++    /* make the dom0 tty match up if we're looking at it... */
++    if (ioctl(0, KDSKBLED, kbd_leds)) {
++        DPRINTF("KDSKBLED failure: %s\n", strerror(errno));
++        return false;
++    }
++
++    if (ioctl(0, KDGKBLED, &kbd_leds)) {
++        DPRINTF("KDGKBLED failure: %s\n", strerror(errno));
++        return false;
++    }
++
++    DPRINTF("KDGKBLED after KDSKBLED = 0x%x\n", kbd_leds);
++
++    return true;
++}
++
++static bool vt_cleanup(void)
++{
++    DPRINTF("entry\n");
++
++    return true;
++}
++
++static const QipsConsoleBackend vt = {
++    .init = vt_init,
++    .lock = vt_lock,
++    .release = vt_release,
++    .get_ledstate = vt_get_ledstate,
++    .set_ledstate = vt_set_ledstate,
++    .cleanup = vt_cleanup,
++};
++
++const QipsConsoleBackend *vt_console_backend_register(void)
++{
++    qips_console_backend_register(&vt);
++
++    return &vt;
++}
+diff --git a/tools/qemu-xen/qips/console-backend/vt.h b/tools/qemu-xen/qips/console-backend/vt.h
+new file mode 100644
+index 0000000..0bd1392
+--- /dev/null
++++ b/tools/qemu-xen/qips/console-backend/vt.h
+@@ -0,0 +1,27 @@
++/*
++ * Copyright (c) 2013 Chris Patterson <cjp256@gmail.com>
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
++ *
++ */
++
++#ifndef QIPS_CONSOLE_BACKEND_VT_H
++#define QIPS_CONSOLE_BACKEND_VT_H
++
++#include "console-backend.h"
++
++const QipsConsoleBackend *vt_console_backend_register(void);
++
++#endif
+diff --git a/tools/qemu-xen/qips/console-frontend/Makefile.objs b/tools/qemu-xen/qips/console-frontend/Makefile.objs
+new file mode 100644
+index 0000000..1cf9d3c
+--- /dev/null
++++ b/tools/qemu-xen/qips/console-frontend/Makefile.objs
+@@ -0,0 +1,2 @@
++qips-obj-y += console-frontend.o
++qips-obj-y += xengt.o
+diff --git a/tools/qemu-xen/qips/console-frontend/console-frontend.c b/tools/qemu-xen/qips/console-frontend/console-frontend.c
+new file mode 100644
+index 0000000..7b81f94
+--- /dev/null
++++ b/tools/qemu-xen/qips/console-frontend/console-frontend.c
+@@ -0,0 +1,42 @@
++/*
++ * Copyright (c) 2013 Chris Patterson <cjp256@gmail.com>
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
++ *
++ */
++
++#include "console-frontend.h"
++
++static const QipsConsoleFrontend *console_frontend = NULL;
++
++void qips_console_frontend_register(const QipsConsoleFrontend * frontend)
++{
++    console_frontend = frontend;
++}
++
++bool qips_console_frontend_init(void)
++{
++    return console_frontend->init();
++}
++
++bool qips_console_frontend_domain_switch(int domain)
++{
++    return console_frontend->domain_switch(domain);
++}
++
++bool qips_console_frontend_cleanup(void)
++{
++    return console_frontend->cleanup();
++}
+diff --git a/tools/qemu-xen/qips/console-frontend/console-frontend.h b/tools/qemu-xen/qips/console-frontend/console-frontend.h
+new file mode 100644
+index 0000000..24e8e76
+--- /dev/null
++++ b/tools/qemu-xen/qips/console-frontend/console-frontend.h
+@@ -0,0 +1,41 @@
++/*
++ * Copyright (c) 2013 Chris Patterson <cjp256@gmail.com>
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
++ *
++ */
++
++#ifndef QIPS_CONSOLE_FRONTEND_H
++#define QIPS_CONSOLE_FRONTEND_H
++
++#include <stdbool.h>
++#include <stdio.h>
++#include "qips/qips.h"
++
++typedef struct {
++    bool(*init) (void);
++    bool(*domain_switch) (int);
++    bool(*cleanup) (void);
++} QipsConsoleFrontend;
++
++void qips_console_frontend_register(const QipsConsoleFrontend * frontend);
++
++bool qips_console_frontend_init(void);
++
++bool qips_console_frontend_domain_switch(int domain);
++
++bool qips_console_frontend_cleanup(void);
++
++#endif
+diff --git a/tools/qemu-xen/qips/console-frontend/xengt.c b/tools/qemu-xen/qips/console-frontend/xengt.c
+new file mode 100644
+index 0000000..eeecfc0
+--- /dev/null
++++ b/tools/qemu-xen/qips/console-frontend/xengt.c
+@@ -0,0 +1,63 @@
++/*
++ * Copyright (c) 2013 Chris Patterson <cjp256@gmail.com>
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
++ *
++ */
++
++#include <stdlib.h>
++#include "xengt.h"
++
++static bool xengt_init(void)
++{
++    DPRINTF("entry");
++    return true;
++}
++
++static bool xengt_switch(int domain)
++{
++    char cmd[4096];
++
++    DPRINTF("switch to domain=%d!\n", domain);
++
++    /* TODO: I'm sure we can do better than this... */
++    snprintf(cmd, sizeof(cmd),
++             "echo %d > /sys/kernel/vgt/control/foreground_vm", domain);
++
++    if (system(cmd)) {
++        DPRINTF("system() failed...");
++    }
++
++    return true;
++}
++
++static bool xengt_cleanup(void)
++{
++    DPRINTF("entry");
++    return true;
++}
++
++static const QipsConsoleFrontend xengt = {
++    .init = xengt_init,
++    .domain_switch = xengt_switch,
++    .cleanup = xengt_cleanup,
++};
++
++const QipsConsoleFrontend *xengt_console_frontend_register(void)
++{
++    qips_console_frontend_register(&xengt);
++
++    return &xengt;
++}
+diff --git a/tools/qemu-xen/qips/console-frontend/xengt.h b/tools/qemu-xen/qips/console-frontend/xengt.h
+new file mode 100644
+index 0000000..87ca8be
+--- /dev/null
++++ b/tools/qemu-xen/qips/console-frontend/xengt.h
+@@ -0,0 +1,27 @@
++/*
++ * Copyright (c) 2013 Chris Patterson <cjp256@gmail.com>
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
++ *
++ */
++
++#ifndef QIPS_CONSOLE_FRONTEND_XENGT_H
++#define QIPS_CONSOLE_FRONTEND_XENGT_H
++
++#include "console-frontend.h"
++
++const QipsConsoleFrontend *xengt_console_frontend_register(void);
++
++#endif
+diff --git a/tools/qemu-xen/qips/input-backend/Makefile.objs b/tools/qemu-xen/qips/input-backend/Makefile.objs
+new file mode 100644
+index 0000000..91c44a8
+--- /dev/null
++++ b/tools/qemu-xen/qips/input-backend/Makefile.objs
+@@ -0,0 +1,2 @@
++qips-obj-y += input-backend.o
++qips-obj-y += evdev.o
+diff --git a/tools/qemu-xen/qips/input-backend/evdev.c b/tools/qemu-xen/qips/input-backend/evdev.c
+new file mode 100644
+index 0000000..e7cb179
+--- /dev/null
++++ b/tools/qemu-xen/qips/input-backend/evdev.c
+@@ -0,0 +1,1087 @@
++/*
++ * Copyright (c) 2013 Chris Patterson <cjp256@gmail.com>
++ *
++ * Many of these bits are adapted/referenced from evtest:
++ *
++ * Copyright (c) 1999-2000 Vojtech Pavlik
++ * Copyright (c) 2009-2011 Red Hat, Inc
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
++ *
++ */
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++#include <errno.h>
++#include <fcntl.h>
++#include <dirent.h>
++#include <linux/input.h>
++#include <sys/types.h>
++#include <sys/stat.h>
++#include <sys/select.h>
++#include <sys/time.h>
++#include <termios.h>
++#include <signal.h>
++#include <sys/socket.h>
++#include <sys/un.h>
++#include <pthread.h>
++#include <sys/inotify.h>
++
++#include "../qemu-common.h"
++#include "qlist.h"
++#include "qemu-thread.h"
++#include "input-backend.h"
++#include "evdev.h"
++#include "ui/x_keymap.h"
++
++#define EVDEV_DPRINTF(msg, ...) do { \
++    if (evdev_debug_mode) syslog(LOG_NOTICE, "%s():L%d: " msg, \
++            __FUNCTION__, __LINE__, ## __VA_ARGS__); \
++} while(0)
++
++#define timestamp_usec(ts) (ts.tv_sec * 1000000 + ts.tv_usec)
++
++// TODO: move key shortcut to input-backend
++static pthread_t evdev_inotify_thread;
++
++#define NAME_ELEMENT(element) [element] = #element
++
++static const uint8_t evdev_keycode_to_pc_keycode[KEY_MAX] = {
++    [0 ... KEY_MAX - 1] = 0,
++    [KEY_RESERVED] = KEY_RESERVED,
++    [KEY_ESC] = KEY_ESC,
++    [KEY_1] = KEY_1,
++    [KEY_2] = KEY_2,
++    [KEY_3] = KEY_3,
++    [KEY_4] = KEY_4,
++    [KEY_5] = KEY_5,
++    [KEY_6] = KEY_6,
++    [KEY_7] = KEY_7,
++    [KEY_8] = KEY_8,
++    [KEY_9] = KEY_9,
++    [KEY_0] = KEY_0,
++    [KEY_MINUS] = KEY_MINUS,
++    [KEY_EQUAL] = KEY_EQUAL,
++    [KEY_BACKSPACE] = KEY_BACKSPACE,
++    [KEY_TAB] = KEY_TAB,
++    [KEY_Q] = KEY_Q,
++    [KEY_W] = KEY_W,
++    [KEY_E] = KEY_E,
++    [KEY_R] = KEY_R,
++    [KEY_T] = KEY_T,
++    [KEY_Y] = KEY_Y,
++    [KEY_U] = KEY_U,
++    [KEY_I] = KEY_I,
++    [KEY_O] = KEY_O,
++    [KEY_P] = KEY_P,
++    [KEY_LEFTBRACE] = KEY_LEFTBRACE,
++    [KEY_RIGHTBRACE] = KEY_RIGHTBRACE,
++    [KEY_ENTER] = KEY_ENTER,
++    [KEY_LEFTCTRL] = KEY_LEFTCTRL,
++    [KEY_A] = KEY_A,
++    [KEY_S] = KEY_S,
++    [KEY_D] = KEY_D,
++    [KEY_F] = KEY_F,
++    [KEY_G] = KEY_G,
++    [KEY_H] = KEY_H,
++    [KEY_J] = KEY_J,
++    [KEY_K] = KEY_K,
++    [KEY_L] = KEY_L,
++    [KEY_SEMICOLON] = KEY_SEMICOLON,
++    [KEY_APOSTROPHE] = KEY_APOSTROPHE,
++    [KEY_GRAVE] = KEY_GRAVE,
++    [KEY_LEFTSHIFT] = KEY_LEFTSHIFT,
++    [KEY_BACKSLASH] = KEY_BACKSLASH,
++    [KEY_Z] = KEY_Z,
++    [KEY_X] = KEY_X,
++    [KEY_C] = KEY_C,
++    [KEY_V] = KEY_V,
++    [KEY_B] = KEY_B,
++    [KEY_N] = KEY_N,
++    [KEY_M] = KEY_M,
++    [KEY_COMMA] = KEY_COMMA,
++    [KEY_DOT] = KEY_DOT,
++    [KEY_SLASH] = KEY_SLASH,
++    [KEY_RIGHTSHIFT] = KEY_RIGHTSHIFT,
++    [KEY_KPASTERISK] = KEY_KPASTERISK,
++    [KEY_LEFTALT] = KEY_LEFTALT,
++    [KEY_SPACE] = KEY_SPACE,
++    [KEY_CAPSLOCK] = KEY_CAPSLOCK,
++    [KEY_F1] = KEY_F1,
++    [KEY_F2] = KEY_F2,
++    [KEY_F3] = KEY_F3,
++    [KEY_F4] = KEY_F4,
++    [KEY_F5] = KEY_F5,
++    [KEY_F6] = KEY_F6,
++    [KEY_F7] = KEY_F7,
++    [KEY_F8] = KEY_F8,
++    [KEY_F9] = KEY_F9,
++    [KEY_F10] = KEY_F10,
++    [KEY_NUMLOCK] = KEY_NUMLOCK,
++    [KEY_SCROLLLOCK] = KEY_SCROLLLOCK,
++    [KEY_KP7] = KEY_KP7,
++    [KEY_KP8] = KEY_KP8,
++    [KEY_KP9] = KEY_KP9,
++    [KEY_KPMINUS] = KEY_KPMINUS,
++    [KEY_KP4] = KEY_KP4,
++    [KEY_KP5] = KEY_KP5,
++    [KEY_KP6] = KEY_KP6,
++    [KEY_KPPLUS] = KEY_KPPLUS,
++    [KEY_KP1] = KEY_KP1,
++    [KEY_KP2] = KEY_KP2,
++    [KEY_KP3] = KEY_KP3,
++    [KEY_KP0] = KEY_KP0,
++    [KEY_KPDOT] = KEY_KPDOT,
++    [KEY_ZENKAKUHANKAKU] = KEY_ZENKAKUHANKAKU,
++    [KEY_102ND] = KEY_102ND,
++    [KEY_F11] = KEY_F11,
++    [KEY_F12] = KEY_F12,
++    [KEY_RO] = 0,
++    [KEY_KATAKANA] = 0,
++    [KEY_HIRAGANA] = 0,
++    [KEY_HENKAN] = 0x79,
++    [KEY_KATAKANAHIRAGANA] = 0x70,
++    [KEY_MUHENKAN] = 0x7b,
++    [KEY_KPJPCOMMA] = 0,
++    [KEY_KPENTER] = 0x9c,
++    [KEY_RIGHTCTRL] = 0x9d,
++    [KEY_KPSLASH] = 0xb5,
++    [KEY_SYSRQ] = 0xb7,
++    [KEY_RIGHTALT] = 0xb8,
++    [KEY_LINEFEED] = 0,
++    [KEY_HOME] = 0xc7,
++    [KEY_UP] = 0xc8,
++    [KEY_PAGEUP] = 0xc9,
++    [KEY_LEFT] = 0xcb,
++    [KEY_RIGHT] = 0xcd,
++    [KEY_END] = 0xcf,
++    [KEY_DOWN] = 0xd0,
++    [KEY_PAGEDOWN] = 0xd1,
++    [KEY_INSERT] = 0xd2,
++    [KEY_DELETE] = 0xd3,
++    [KEY_MACRO] = 0,
++    [KEY_MUTE] = 0,
++    [KEY_VOLUMEDOWN] = 0,
++    [KEY_VOLUMEUP] = 0,
++    [KEY_POWER] = 0,
++    [KEY_KPEQUAL] = 0,
++    [KEY_KPPLUSMINUS] = 0,
++    [KEY_PAUSE] = 0,
++    [KEY_SCALE] = 0,
++    [KEY_KPCOMMA] = 0,
++    [KEY_HANGEUL] = 0xf1,
++    [KEY_HANJA] = 0xf2,
++    [KEY_YEN] = 0x7b,
++    [KEY_LEFTMETA] = 0xdb,
++    [KEY_RIGHTMETA] = 0xdc,
++    [KEY_COMPOSE] = 0xdd,
++    [KEY_STOP] = 0,
++    [KEY_AGAIN] = 0,
++    [KEY_PROPS] = 0,
++    [KEY_UNDO] = 0,
++    [KEY_FRONT] = 0,
++    [KEY_COPY] = 0,
++    [KEY_OPEN] = 0,
++    [KEY_PASTE] = 0,
++    [KEY_FIND] = 0,
++    [KEY_CUT] = 0,
++    [KEY_HELP] = 0,
++    [KEY_MENU] = 0,
++    [KEY_CALC] = 0,
++    [KEY_SETUP] = 0,
++    [KEY_SLEEP] = 0,
++    [KEY_WAKEUP] = 0,
++    [KEY_FILE] = 0,
++    [KEY_SENDFILE] = 0,
++    [KEY_DELETEFILE] = 0,
++    [KEY_XFER] = 0,
++    [KEY_PROG1] = 0,
++    [KEY_PROG2] = 0,
++};
++
++static const char *const events[EV_MAX + 1] = {
++    [0 ... EV_MAX] = NULL,
++    NAME_ELEMENT(EV_SYN), NAME_ELEMENT(EV_KEY),
++    NAME_ELEMENT(EV_REL), NAME_ELEMENT(EV_ABS),
++    NAME_ELEMENT(EV_MSC), NAME_ELEMENT(EV_LED),
++    NAME_ELEMENT(EV_SND), NAME_ELEMENT(EV_REP),
++    NAME_ELEMENT(EV_FF), NAME_ELEMENT(EV_PWR),
++    NAME_ELEMENT(EV_FF_STATUS), NAME_ELEMENT(EV_SW),
++};
++
++#ifdef INPUT_PROP_SEMI_MT
++static const char *const props[INPUT_PROP_MAX + 1] = {
++    [0 ... INPUT_PROP_MAX] = NULL,
++    NAME_ELEMENT(INPUT_PROP_POINTER),
++    NAME_ELEMENT(INPUT_PROP_DIRECT),
++    NAME_ELEMENT(INPUT_PROP_BUTTONPAD),
++    NAME_ELEMENT(INPUT_PROP_SEMI_MT),
++};
++#endif
++
++static const char *const keys[KEY_MAX + 1] = {
++    [0 ... KEY_MAX] = NULL,
++    NAME_ELEMENT(KEY_RESERVED), NAME_ELEMENT(KEY_ESC),
++    NAME_ELEMENT(KEY_1), NAME_ELEMENT(KEY_2),
++    NAME_ELEMENT(KEY_3), NAME_ELEMENT(KEY_4),
++    NAME_ELEMENT(KEY_5), NAME_ELEMENT(KEY_6),
++    NAME_ELEMENT(KEY_7), NAME_ELEMENT(KEY_8),
++    NAME_ELEMENT(KEY_9), NAME_ELEMENT(KEY_0),
++    NAME_ELEMENT(KEY_MINUS), NAME_ELEMENT(KEY_EQUAL),
++    NAME_ELEMENT(KEY_BACKSPACE), NAME_ELEMENT(KEY_TAB),
++    NAME_ELEMENT(KEY_Q), NAME_ELEMENT(KEY_W),
++    NAME_ELEMENT(KEY_E), NAME_ELEMENT(KEY_R),
++    NAME_ELEMENT(KEY_T), NAME_ELEMENT(KEY_Y),
++    NAME_ELEMENT(KEY_U), NAME_ELEMENT(KEY_I),
++    NAME_ELEMENT(KEY_O), NAME_ELEMENT(KEY_P),
++    NAME_ELEMENT(KEY_LEFTBRACE), NAME_ELEMENT(KEY_RIGHTBRACE),
++    NAME_ELEMENT(KEY_ENTER), NAME_ELEMENT(KEY_LEFTCTRL),
++    NAME_ELEMENT(KEY_A), NAME_ELEMENT(KEY_S),
++    NAME_ELEMENT(KEY_D), NAME_ELEMENT(KEY_F),
++    NAME_ELEMENT(KEY_G), NAME_ELEMENT(KEY_H),
++    NAME_ELEMENT(KEY_J), NAME_ELEMENT(KEY_K),
++    NAME_ELEMENT(KEY_L), NAME_ELEMENT(KEY_SEMICOLON),
++    NAME_ELEMENT(KEY_APOSTROPHE), NAME_ELEMENT(KEY_GRAVE),
++    NAME_ELEMENT(KEY_LEFTSHIFT), NAME_ELEMENT(KEY_BACKSLASH),
++    NAME_ELEMENT(KEY_Z), NAME_ELEMENT(KEY_X),
++    NAME_ELEMENT(KEY_C), NAME_ELEMENT(KEY_V),
++    NAME_ELEMENT(KEY_B), NAME_ELEMENT(KEY_N),
++    NAME_ELEMENT(KEY_M), NAME_ELEMENT(KEY_COMMA),
++    NAME_ELEMENT(KEY_DOT), NAME_ELEMENT(KEY_SLASH),
++    NAME_ELEMENT(KEY_RIGHTSHIFT), NAME_ELEMENT(KEY_KPASTERISK),
++    NAME_ELEMENT(KEY_LEFTALT), NAME_ELEMENT(KEY_SPACE),
++    NAME_ELEMENT(KEY_CAPSLOCK), NAME_ELEMENT(KEY_F1),
++    NAME_ELEMENT(KEY_F2), NAME_ELEMENT(KEY_F3),
++    NAME_ELEMENT(KEY_F4), NAME_ELEMENT(KEY_F5),
++    NAME_ELEMENT(KEY_F6), NAME_ELEMENT(KEY_F7),
++    NAME_ELEMENT(KEY_F8), NAME_ELEMENT(KEY_F9),
++    NAME_ELEMENT(KEY_F10), NAME_ELEMENT(KEY_NUMLOCK),
++    NAME_ELEMENT(KEY_SCROLLLOCK), NAME_ELEMENT(KEY_KP7),
++    NAME_ELEMENT(KEY_KP8), NAME_ELEMENT(KEY_KP9),
++    NAME_ELEMENT(KEY_KPMINUS), NAME_ELEMENT(KEY_KP4),
++    NAME_ELEMENT(KEY_KP5), NAME_ELEMENT(KEY_KP6),
++    NAME_ELEMENT(KEY_KPPLUS), NAME_ELEMENT(KEY_KP1),
++    NAME_ELEMENT(KEY_KP2), NAME_ELEMENT(KEY_KP3),
++    NAME_ELEMENT(KEY_KP0), NAME_ELEMENT(KEY_KPDOT),
++    NAME_ELEMENT(KEY_ZENKAKUHANKAKU), NAME_ELEMENT(KEY_102ND),
++    NAME_ELEMENT(KEY_F11), NAME_ELEMENT(KEY_F12),
++    NAME_ELEMENT(KEY_RO), NAME_ELEMENT(KEY_KATAKANA),
++    NAME_ELEMENT(KEY_HIRAGANA), NAME_ELEMENT(KEY_HENKAN),
++    NAME_ELEMENT(KEY_KATAKANAHIRAGANA), NAME_ELEMENT(KEY_MUHENKAN),
++    NAME_ELEMENT(KEY_KPJPCOMMA), NAME_ELEMENT(KEY_KPENTER),
++    NAME_ELEMENT(KEY_RIGHTCTRL), NAME_ELEMENT(KEY_KPSLASH),
++    NAME_ELEMENT(KEY_SYSRQ), NAME_ELEMENT(KEY_RIGHTALT),
++    NAME_ELEMENT(KEY_LINEFEED), NAME_ELEMENT(KEY_HOME),
++    NAME_ELEMENT(KEY_UP), NAME_ELEMENT(KEY_PAGEUP),
++    NAME_ELEMENT(KEY_LEFT), NAME_ELEMENT(KEY_RIGHT),
++    NAME_ELEMENT(KEY_END), NAME_ELEMENT(KEY_DOWN),
++    NAME_ELEMENT(KEY_PAGEDOWN), NAME_ELEMENT(KEY_INSERT),
++    NAME_ELEMENT(KEY_DELETE), NAME_ELEMENT(KEY_MACRO),
++    NAME_ELEMENT(KEY_MUTE), NAME_ELEMENT(KEY_VOLUMEDOWN),
++    NAME_ELEMENT(KEY_VOLUMEUP), NAME_ELEMENT(KEY_POWER),
++    NAME_ELEMENT(KEY_KPEQUAL), NAME_ELEMENT(KEY_KPPLUSMINUS),
++    NAME_ELEMENT(KEY_PAUSE), NAME_ELEMENT(KEY_KPCOMMA),
++    NAME_ELEMENT(KEY_HANGUEL), NAME_ELEMENT(KEY_HANJA),
++    NAME_ELEMENT(KEY_YEN), NAME_ELEMENT(KEY_LEFTMETA),
++    NAME_ELEMENT(KEY_RIGHTMETA), NAME_ELEMENT(KEY_COMPOSE),
++    NAME_ELEMENT(KEY_STOP), NAME_ELEMENT(KEY_AGAIN),
++    NAME_ELEMENT(KEY_PROPS), NAME_ELEMENT(KEY_UNDO),
++    NAME_ELEMENT(KEY_FRONT), NAME_ELEMENT(KEY_COPY),
++    NAME_ELEMENT(KEY_OPEN), NAME_ELEMENT(KEY_PASTE),
++    NAME_ELEMENT(KEY_FIND), NAME_ELEMENT(KEY_CUT),
++    NAME_ELEMENT(KEY_HELP), NAME_ELEMENT(KEY_MENU),
++    NAME_ELEMENT(KEY_CALC), NAME_ELEMENT(KEY_SETUP),
++    NAME_ELEMENT(KEY_SLEEP), NAME_ELEMENT(KEY_WAKEUP),
++    NAME_ELEMENT(KEY_FILE), NAME_ELEMENT(KEY_SENDFILE),
++    NAME_ELEMENT(KEY_DELETEFILE), NAME_ELEMENT(KEY_XFER),
++    NAME_ELEMENT(KEY_PROG1), NAME_ELEMENT(KEY_PROG2),
++    NAME_ELEMENT(KEY_WWW), NAME_ELEMENT(KEY_MSDOS),
++    NAME_ELEMENT(KEY_COFFEE), NAME_ELEMENT(KEY_DIRECTION),
++    NAME_ELEMENT(KEY_CYCLEWINDOWS), NAME_ELEMENT(KEY_MAIL),
++    NAME_ELEMENT(KEY_BOOKMARKS), NAME_ELEMENT(KEY_COMPUTER),
++    NAME_ELEMENT(KEY_BACK), NAME_ELEMENT(KEY_FORWARD),
++    NAME_ELEMENT(KEY_CLOSECD), NAME_ELEMENT(KEY_EJECTCD),
++    NAME_ELEMENT(KEY_EJECTCLOSECD), NAME_ELEMENT(KEY_NEXTSONG),
++    NAME_ELEMENT(KEY_PLAYPAUSE), NAME_ELEMENT(KEY_PREVIOUSSONG),
++    NAME_ELEMENT(KEY_STOPCD), NAME_ELEMENT(KEY_RECORD),
++    NAME_ELEMENT(KEY_REWIND), NAME_ELEMENT(KEY_PHONE),
++    NAME_ELEMENT(KEY_ISO), NAME_ELEMENT(KEY_CONFIG),
++    NAME_ELEMENT(KEY_HOMEPAGE), NAME_ELEMENT(KEY_REFRESH),
++    NAME_ELEMENT(KEY_EXIT), NAME_ELEMENT(KEY_MOVE),
++    NAME_ELEMENT(KEY_EDIT), NAME_ELEMENT(KEY_SCROLLUP),
++    NAME_ELEMENT(KEY_SCROLLDOWN), NAME_ELEMENT(KEY_KPLEFTPAREN),
++    NAME_ELEMENT(KEY_KPRIGHTPAREN), NAME_ELEMENT(KEY_F13),
++    NAME_ELEMENT(KEY_F14), NAME_ELEMENT(KEY_F15),
++    NAME_ELEMENT(KEY_F16), NAME_ELEMENT(KEY_F17),
++    NAME_ELEMENT(KEY_F18), NAME_ELEMENT(KEY_F19),
++    NAME_ELEMENT(KEY_F20), NAME_ELEMENT(KEY_F21),
++    NAME_ELEMENT(KEY_F22), NAME_ELEMENT(KEY_F23),
++    NAME_ELEMENT(KEY_F24), NAME_ELEMENT(KEY_PLAYCD),
++    NAME_ELEMENT(KEY_PAUSECD), NAME_ELEMENT(KEY_PROG3),
++    NAME_ELEMENT(KEY_PROG4), NAME_ELEMENT(KEY_SUSPEND),
++    NAME_ELEMENT(KEY_CLOSE), NAME_ELEMENT(KEY_PLAY),
++    NAME_ELEMENT(KEY_FASTFORWARD), NAME_ELEMENT(KEY_BASSBOOST),
++    NAME_ELEMENT(KEY_PRINT), NAME_ELEMENT(KEY_HP),
++    NAME_ELEMENT(KEY_CAMERA), NAME_ELEMENT(KEY_SOUND),
++    NAME_ELEMENT(KEY_QUESTION), NAME_ELEMENT(KEY_EMAIL),
++    NAME_ELEMENT(KEY_CHAT), NAME_ELEMENT(KEY_SEARCH),
++    NAME_ELEMENT(KEY_CONNECT), NAME_ELEMENT(KEY_FINANCE),
++    NAME_ELEMENT(KEY_SPORT), NAME_ELEMENT(KEY_SHOP),
++    NAME_ELEMENT(KEY_ALTERASE), NAME_ELEMENT(KEY_CANCEL),
++    NAME_ELEMENT(KEY_BRIGHTNESSDOWN), NAME_ELEMENT(KEY_BRIGHTNESSUP),
++    NAME_ELEMENT(KEY_MEDIA), NAME_ELEMENT(KEY_UNKNOWN),
++    NAME_ELEMENT(KEY_OK),
++    NAME_ELEMENT(KEY_SELECT), NAME_ELEMENT(KEY_GOTO),
++    NAME_ELEMENT(KEY_CLEAR), NAME_ELEMENT(KEY_POWER2),
++    NAME_ELEMENT(KEY_OPTION), NAME_ELEMENT(KEY_INFO),
++    NAME_ELEMENT(KEY_TIME), NAME_ELEMENT(KEY_VENDOR),
++    NAME_ELEMENT(KEY_ARCHIVE), NAME_ELEMENT(KEY_PROGRAM),
++    NAME_ELEMENT(KEY_CHANNEL), NAME_ELEMENT(KEY_FAVORITES),
++    NAME_ELEMENT(KEY_EPG), NAME_ELEMENT(KEY_PVR),
++    NAME_ELEMENT(KEY_MHP), NAME_ELEMENT(KEY_LANGUAGE),
++    NAME_ELEMENT(KEY_TITLE), NAME_ELEMENT(KEY_SUBTITLE),
++    NAME_ELEMENT(KEY_ANGLE), NAME_ELEMENT(KEY_ZOOM),
++    NAME_ELEMENT(KEY_MODE), NAME_ELEMENT(KEY_KEYBOARD),
++    NAME_ELEMENT(KEY_SCREEN), NAME_ELEMENT(KEY_PC),
++    NAME_ELEMENT(KEY_TV), NAME_ELEMENT(KEY_TV2),
++    NAME_ELEMENT(KEY_VCR), NAME_ELEMENT(KEY_VCR2),
++    NAME_ELEMENT(KEY_SAT), NAME_ELEMENT(KEY_SAT2),
++    NAME_ELEMENT(KEY_CD), NAME_ELEMENT(KEY_TAPE),
++    NAME_ELEMENT(KEY_RADIO), NAME_ELEMENT(KEY_TUNER),
++    NAME_ELEMENT(KEY_PLAYER), NAME_ELEMENT(KEY_TEXT),
++    NAME_ELEMENT(KEY_DVD), NAME_ELEMENT(KEY_AUX),
++    NAME_ELEMENT(KEY_MP3), NAME_ELEMENT(KEY_AUDIO),
++    NAME_ELEMENT(KEY_VIDEO), NAME_ELEMENT(KEY_DIRECTORY),
++    NAME_ELEMENT(KEY_LIST), NAME_ELEMENT(KEY_MEMO),
++    NAME_ELEMENT(KEY_CALENDAR), NAME_ELEMENT(KEY_RED),
++    NAME_ELEMENT(KEY_GREEN), NAME_ELEMENT(KEY_YELLOW),
++    NAME_ELEMENT(KEY_BLUE), NAME_ELEMENT(KEY_CHANNELUP),
++    NAME_ELEMENT(KEY_CHANNELDOWN), NAME_ELEMENT(KEY_FIRST),
++    NAME_ELEMENT(KEY_LAST), NAME_ELEMENT(KEY_AB),
++    NAME_ELEMENT(KEY_NEXT), NAME_ELEMENT(KEY_RESTART),
++    NAME_ELEMENT(KEY_SLOW), NAME_ELEMENT(KEY_SHUFFLE),
++    NAME_ELEMENT(KEY_BREAK), NAME_ELEMENT(KEY_PREVIOUS),
++    NAME_ELEMENT(KEY_DIGITS), NAME_ELEMENT(KEY_TEEN),
++    NAME_ELEMENT(KEY_TWEN), NAME_ELEMENT(KEY_DEL_EOL),
++    NAME_ELEMENT(KEY_DEL_EOS), NAME_ELEMENT(KEY_INS_LINE),
++    NAME_ELEMENT(KEY_DEL_LINE),
++    NAME_ELEMENT(KEY_VIDEOPHONE), NAME_ELEMENT(KEY_GAMES),
++    NAME_ELEMENT(KEY_ZOOMIN), NAME_ELEMENT(KEY_ZOOMOUT),
++    NAME_ELEMENT(KEY_ZOOMRESET), NAME_ELEMENT(KEY_WORDPROCESSOR),
++    NAME_ELEMENT(KEY_EDITOR), NAME_ELEMENT(KEY_SPREADSHEET),
++    NAME_ELEMENT(KEY_GRAPHICSEDITOR), NAME_ELEMENT(KEY_PRESENTATION),
++    NAME_ELEMENT(KEY_DATABASE), NAME_ELEMENT(KEY_NEWS),
++    NAME_ELEMENT(KEY_VOICEMAIL), NAME_ELEMENT(KEY_ADDRESSBOOK),
++    NAME_ELEMENT(KEY_MESSENGER), NAME_ELEMENT(KEY_DISPLAYTOGGLE),
++    NAME_ELEMENT(KEY_SPELLCHECK), NAME_ELEMENT(KEY_LOGOFF),
++    NAME_ELEMENT(KEY_DOLLAR), NAME_ELEMENT(KEY_EURO),
++    NAME_ELEMENT(KEY_FRAMEBACK), NAME_ELEMENT(KEY_FRAMEFORWARD),
++    NAME_ELEMENT(KEY_CONTEXT_MENU), NAME_ELEMENT(KEY_MEDIA_REPEAT),
++    NAME_ELEMENT(KEY_DEL_EOL), NAME_ELEMENT(KEY_DEL_EOS),
++    NAME_ELEMENT(KEY_INS_LINE), NAME_ELEMENT(KEY_DEL_LINE),
++    NAME_ELEMENT(KEY_FN), NAME_ELEMENT(KEY_FN_ESC),
++    NAME_ELEMENT(KEY_FN_F1), NAME_ELEMENT(KEY_FN_F2),
++    NAME_ELEMENT(KEY_FN_F3), NAME_ELEMENT(KEY_FN_F4),
++    NAME_ELEMENT(KEY_FN_F5), NAME_ELEMENT(KEY_FN_F6),
++    NAME_ELEMENT(KEY_FN_F7), NAME_ELEMENT(KEY_FN_F8),
++    NAME_ELEMENT(KEY_FN_F9), NAME_ELEMENT(KEY_FN_F10),
++    NAME_ELEMENT(KEY_FN_F11), NAME_ELEMENT(KEY_FN_F12),
++    NAME_ELEMENT(KEY_FN_1), NAME_ELEMENT(KEY_FN_2),
++    NAME_ELEMENT(KEY_FN_D), NAME_ELEMENT(KEY_FN_E),
++    NAME_ELEMENT(KEY_FN_F), NAME_ELEMENT(KEY_FN_S),
++    NAME_ELEMENT(KEY_FN_B),
++    NAME_ELEMENT(KEY_BRL_DOT1), NAME_ELEMENT(KEY_BRL_DOT2),
++    NAME_ELEMENT(KEY_BRL_DOT3), NAME_ELEMENT(KEY_BRL_DOT4),
++    NAME_ELEMENT(KEY_BRL_DOT5), NAME_ELEMENT(KEY_BRL_DOT6),
++    NAME_ELEMENT(KEY_BRL_DOT7), NAME_ELEMENT(KEY_BRL_DOT8),
++    NAME_ELEMENT(KEY_BRL_DOT9), NAME_ELEMENT(KEY_BRL_DOT10),
++    NAME_ELEMENT(KEY_NUMERIC_0), NAME_ELEMENT(KEY_NUMERIC_1),
++    NAME_ELEMENT(KEY_NUMERIC_2), NAME_ELEMENT(KEY_NUMERIC_3),
++    NAME_ELEMENT(KEY_NUMERIC_4), NAME_ELEMENT(KEY_NUMERIC_5),
++    NAME_ELEMENT(KEY_NUMERIC_6), NAME_ELEMENT(KEY_NUMERIC_7),
++    NAME_ELEMENT(KEY_NUMERIC_8), NAME_ELEMENT(KEY_NUMERIC_9),
++    NAME_ELEMENT(KEY_NUMERIC_STAR), NAME_ELEMENT(KEY_NUMERIC_POUND),
++    NAME_ELEMENT(KEY_BATTERY),
++    NAME_ELEMENT(KEY_BLUETOOTH), NAME_ELEMENT(KEY_BRIGHTNESS_CYCLE),
++    NAME_ELEMENT(KEY_BRIGHTNESS_ZERO), NAME_ELEMENT(KEY_DASHBOARD),
++    NAME_ELEMENT(KEY_DISPLAY_OFF), NAME_ELEMENT(KEY_DOCUMENTS),
++    NAME_ELEMENT(KEY_FORWARDMAIL), NAME_ELEMENT(KEY_NEW),
++    NAME_ELEMENT(KEY_KBDILLUMDOWN), NAME_ELEMENT(KEY_KBDILLUMUP),
++    NAME_ELEMENT(KEY_KBDILLUMTOGGLE), NAME_ELEMENT(KEY_REDO),
++    NAME_ELEMENT(KEY_REPLY), NAME_ELEMENT(KEY_SAVE),
++    NAME_ELEMENT(KEY_SCALE), NAME_ELEMENT(KEY_SEND),
++    NAME_ELEMENT(KEY_SCREENLOCK), NAME_ELEMENT(KEY_SWITCHVIDEOMODE),
++    NAME_ELEMENT(KEY_UWB), NAME_ELEMENT(KEY_VIDEO_NEXT),
++    NAME_ELEMENT(KEY_VIDEO_PREV), NAME_ELEMENT(KEY_WIMAX),
++    NAME_ELEMENT(KEY_WLAN),
++#ifdef KEY_RFKILL
++    NAME_ELEMENT(KEY_RFKILL),
++#endif
++#ifdef KEY_WPS_BUTTON
++    NAME_ELEMENT(KEY_WPS_BUTTON),
++#endif
++#ifdef KEY_TOUCHPAD_TOGGLE
++    NAME_ELEMENT(KEY_TOUCHPAD_TOGGLE),
++    NAME_ELEMENT(KEY_TOUCHPAD_ON),
++    NAME_ELEMENT(KEY_TOUCHPAD_OFF),
++#endif
++
++    NAME_ELEMENT(BTN_0), NAME_ELEMENT(BTN_1),
++    NAME_ELEMENT(BTN_2), NAME_ELEMENT(BTN_3),
++    NAME_ELEMENT(BTN_4), NAME_ELEMENT(BTN_5),
++    NAME_ELEMENT(BTN_6), NAME_ELEMENT(BTN_7),
++    NAME_ELEMENT(BTN_8), NAME_ELEMENT(BTN_9),
++    NAME_ELEMENT(BTN_LEFT), NAME_ELEMENT(BTN_RIGHT),
++    NAME_ELEMENT(BTN_MIDDLE), NAME_ELEMENT(BTN_SIDE),
++    NAME_ELEMENT(BTN_EXTRA), NAME_ELEMENT(BTN_FORWARD),
++    NAME_ELEMENT(BTN_BACK), NAME_ELEMENT(BTN_TASK),
++    NAME_ELEMENT(BTN_TRIGGER), NAME_ELEMENT(BTN_THUMB),
++    NAME_ELEMENT(BTN_THUMB2), NAME_ELEMENT(BTN_TOP),
++    NAME_ELEMENT(BTN_TOP2), NAME_ELEMENT(BTN_PINKIE),
++    NAME_ELEMENT(BTN_BASE), NAME_ELEMENT(BTN_BASE2),
++    NAME_ELEMENT(BTN_BASE3), NAME_ELEMENT(BTN_BASE4),
++    NAME_ELEMENT(BTN_BASE5), NAME_ELEMENT(BTN_BASE6),
++    NAME_ELEMENT(BTN_DEAD), NAME_ELEMENT(BTN_A),
++    NAME_ELEMENT(BTN_B), NAME_ELEMENT(BTN_C),
++    NAME_ELEMENT(BTN_X), NAME_ELEMENT(BTN_Y),
++    NAME_ELEMENT(BTN_Z), NAME_ELEMENT(BTN_TL),
++    NAME_ELEMENT(BTN_TR), NAME_ELEMENT(BTN_TL2),
++    NAME_ELEMENT(BTN_TR2), NAME_ELEMENT(BTN_SELECT),
++    NAME_ELEMENT(BTN_START), NAME_ELEMENT(BTN_MODE),
++    NAME_ELEMENT(BTN_THUMBL), NAME_ELEMENT(BTN_THUMBR),
++    NAME_ELEMENT(BTN_TOOL_PEN), NAME_ELEMENT(BTN_TOOL_RUBBER),
++    NAME_ELEMENT(BTN_TOOL_BRUSH), NAME_ELEMENT(BTN_TOOL_PENCIL),
++    NAME_ELEMENT(BTN_TOOL_AIRBRUSH), NAME_ELEMENT(BTN_TOOL_FINGER),
++    NAME_ELEMENT(BTN_TOOL_MOUSE), NAME_ELEMENT(BTN_TOOL_LENS),
++    NAME_ELEMENT(BTN_TOUCH), NAME_ELEMENT(BTN_STYLUS),
++    NAME_ELEMENT(BTN_STYLUS2), NAME_ELEMENT(BTN_TOOL_DOUBLETAP),
++    NAME_ELEMENT(BTN_TOOL_TRIPLETAP), NAME_ELEMENT(BTN_TOOL_QUADTAP),
++    NAME_ELEMENT(BTN_GEAR_DOWN),
++    NAME_ELEMENT(BTN_GEAR_UP),
++
++#ifdef BTN_TRIGGER_HAPPY
++    NAME_ELEMENT(BTN_TRIGGER_HAPPY1), NAME_ELEMENT(BTN_TRIGGER_HAPPY11),
++    NAME_ELEMENT(BTN_TRIGGER_HAPPY2), NAME_ELEMENT(BTN_TRIGGER_HAPPY12),
++    NAME_ELEMENT(BTN_TRIGGER_HAPPY3), NAME_ELEMENT(BTN_TRIGGER_HAPPY13),
++    NAME_ELEMENT(BTN_TRIGGER_HAPPY4), NAME_ELEMENT(BTN_TRIGGER_HAPPY14),
++    NAME_ELEMENT(BTN_TRIGGER_HAPPY5), NAME_ELEMENT(BTN_TRIGGER_HAPPY15),
++    NAME_ELEMENT(BTN_TRIGGER_HAPPY6), NAME_ELEMENT(BTN_TRIGGER_HAPPY16),
++    NAME_ELEMENT(BTN_TRIGGER_HAPPY7), NAME_ELEMENT(BTN_TRIGGER_HAPPY17),
++    NAME_ELEMENT(BTN_TRIGGER_HAPPY8), NAME_ELEMENT(BTN_TRIGGER_HAPPY18),
++    NAME_ELEMENT(BTN_TRIGGER_HAPPY9), NAME_ELEMENT(BTN_TRIGGER_HAPPY19),
++    NAME_ELEMENT(BTN_TRIGGER_HAPPY10), NAME_ELEMENT(BTN_TRIGGER_HAPPY20),
++
++    NAME_ELEMENT(BTN_TRIGGER_HAPPY21), NAME_ELEMENT(BTN_TRIGGER_HAPPY31),
++    NAME_ELEMENT(BTN_TRIGGER_HAPPY22), NAME_ELEMENT(BTN_TRIGGER_HAPPY32),
++    NAME_ELEMENT(BTN_TRIGGER_HAPPY23), NAME_ELEMENT(BTN_TRIGGER_HAPPY33),
++    NAME_ELEMENT(BTN_TRIGGER_HAPPY24), NAME_ELEMENT(BTN_TRIGGER_HAPPY34),
++    NAME_ELEMENT(BTN_TRIGGER_HAPPY25), NAME_ELEMENT(BTN_TRIGGER_HAPPY35),
++    NAME_ELEMENT(BTN_TRIGGER_HAPPY26), NAME_ELEMENT(BTN_TRIGGER_HAPPY36),
++    NAME_ELEMENT(BTN_TRIGGER_HAPPY27), NAME_ELEMENT(BTN_TRIGGER_HAPPY37),
++    NAME_ELEMENT(BTN_TRIGGER_HAPPY28), NAME_ELEMENT(BTN_TRIGGER_HAPPY38),
++    NAME_ELEMENT(BTN_TRIGGER_HAPPY29), NAME_ELEMENT(BTN_TRIGGER_HAPPY39),
++    NAME_ELEMENT(BTN_TRIGGER_HAPPY30), NAME_ELEMENT(BTN_TRIGGER_HAPPY40),
++#endif
++#ifdef BTN_TOOL_QUINTTAP
++    NAME_ELEMENT(BTN_TOOL_QUINTTAP),
++#endif
++};
++
++static const char *const absval[6] =
++    { "Value", "Min  ", "Max  ", "Fuzz ", "Flat ", "Resolution " };
++
++static const char *const relatives[REL_MAX + 1] = {
++    [0 ... REL_MAX] = NULL,
++    NAME_ELEMENT(REL_X), NAME_ELEMENT(REL_Y),
++    NAME_ELEMENT(REL_Z), NAME_ELEMENT(REL_RX),
++    NAME_ELEMENT(REL_RY), NAME_ELEMENT(REL_RZ),
++    NAME_ELEMENT(REL_HWHEEL),
++    NAME_ELEMENT(REL_DIAL), NAME_ELEMENT(REL_WHEEL),
++    NAME_ELEMENT(REL_MISC),
++};
++
++static const char *const absolutes[ABS_MAX + 1] = {
++    [0 ... ABS_MAX] = NULL,
++    NAME_ELEMENT(ABS_X), NAME_ELEMENT(ABS_Y),
++    NAME_ELEMENT(ABS_Z), NAME_ELEMENT(ABS_RX),
++    NAME_ELEMENT(ABS_RY), NAME_ELEMENT(ABS_RZ),
++    NAME_ELEMENT(ABS_THROTTLE), NAME_ELEMENT(ABS_RUDDER),
++    NAME_ELEMENT(ABS_WHEEL), NAME_ELEMENT(ABS_GAS),
++    NAME_ELEMENT(ABS_BRAKE), NAME_ELEMENT(ABS_HAT0X),
++    NAME_ELEMENT(ABS_HAT0Y), NAME_ELEMENT(ABS_HAT1X),
++    NAME_ELEMENT(ABS_HAT1Y), NAME_ELEMENT(ABS_HAT2X),
++    NAME_ELEMENT(ABS_HAT2Y), NAME_ELEMENT(ABS_HAT3X),
++    NAME_ELEMENT(ABS_HAT3Y), NAME_ELEMENT(ABS_PRESSURE),
++    NAME_ELEMENT(ABS_DISTANCE), NAME_ELEMENT(ABS_TILT_X),
++    NAME_ELEMENT(ABS_TILT_Y), NAME_ELEMENT(ABS_TOOL_WIDTH),
++    NAME_ELEMENT(ABS_VOLUME), NAME_ELEMENT(ABS_MISC),
++#ifdef ABS_MT_BLOB_ID
++    NAME_ELEMENT(ABS_MT_TOUCH_MAJOR),
++    NAME_ELEMENT(ABS_MT_TOUCH_MINOR),
++    NAME_ELEMENT(ABS_MT_WIDTH_MAJOR),
++    NAME_ELEMENT(ABS_MT_WIDTH_MINOR),
++    NAME_ELEMENT(ABS_MT_ORIENTATION),
++    NAME_ELEMENT(ABS_MT_POSITION_X),
++    NAME_ELEMENT(ABS_MT_POSITION_Y),
++    NAME_ELEMENT(ABS_MT_TOOL_TYPE),
++    NAME_ELEMENT(ABS_MT_BLOB_ID),
++#endif
++#ifdef ABS_MT_TRACKING_ID
++    NAME_ELEMENT(ABS_MT_TRACKING_ID),
++#endif
++#ifdef ABS_MT_PRESSURE
++    NAME_ELEMENT(ABS_MT_PRESSURE),
++#endif
++#ifdef ABS_MT_SLOT
++    NAME_ELEMENT(ABS_MT_SLOT),
++#endif
++#ifdef ABS_MT_TOOL_X
++    NAME_ELEMENT(ABS_MT_TOOL_X),
++    NAME_ELEMENT(ABS_MT_TOOL_Y),
++    NAME_ELEMENT(ABS_MT_DISTANCE),
++#endif
++
++};
++
++static const char *const misc[MSC_MAX + 1] = {
++    [0 ... MSC_MAX] = NULL,
++    NAME_ELEMENT(MSC_SERIAL), NAME_ELEMENT(MSC_PULSELED),
++    NAME_ELEMENT(MSC_GESTURE), NAME_ELEMENT(MSC_RAW),
++    NAME_ELEMENT(MSC_SCAN),
++#ifdef MSC_TIMESTAMP
++    NAME_ELEMENT(MSC_TIMESTAMP),
++#endif
++};
++
++static const char *const leds[LED_MAX + 1] = {
++    [0 ... LED_MAX] = NULL,
++    NAME_ELEMENT(LED_NUML), NAME_ELEMENT(LED_CAPSL),
++    NAME_ELEMENT(LED_SCROLLL), NAME_ELEMENT(LED_COMPOSE),
++    NAME_ELEMENT(LED_KANA), NAME_ELEMENT(LED_SLEEP),
++    NAME_ELEMENT(LED_SUSPEND), NAME_ELEMENT(LED_MUTE),
++    NAME_ELEMENT(LED_MISC),
++};
++
++static const char *const repeats[REP_MAX + 1] = {
++    [0 ... REP_MAX] = NULL,
++    NAME_ELEMENT(REP_DELAY), NAME_ELEMENT(REP_PERIOD)
++};
++
++static const char *const sounds[SND_MAX + 1] = {
++    [0 ... SND_MAX] = NULL,
++    NAME_ELEMENT(SND_CLICK), NAME_ELEMENT(SND_BELL),
++    NAME_ELEMENT(SND_TONE)
++};
++
++static const char *const syns[3] = {
++    NAME_ELEMENT(SYN_REPORT),
++    NAME_ELEMENT(SYN_CONFIG),
++#ifdef SYN_MT_REPORT
++    NAME_ELEMENT(SYN_MT_REPORT)
++#endif
++};
++
++static const char *const switches[SW_MAX + 1] = {
++    [0 ... SW_MAX] = NULL,
++    NAME_ELEMENT(SW_LID),
++    NAME_ELEMENT(SW_TABLET_MODE),
++    NAME_ELEMENT(SW_HEADPHONE_INSERT),
++    NAME_ELEMENT(SW_RFKILL_ALL),
++    NAME_ELEMENT(SW_MICROPHONE_INSERT),
++    NAME_ELEMENT(SW_DOCK),
++    NAME_ELEMENT(SW_LINEOUT_INSERT),
++    NAME_ELEMENT(SW_JACK_PHYSICAL_INSERT),
++#ifdef SW_VIDEOOUT_INSERT
++    NAME_ELEMENT(SW_VIDEOOUT_INSERT),
++#endif
++#ifdef SW_CAMERA_LENS_COVER
++    NAME_ELEMENT(SW_CAMERA_LENS_COVER),
++    NAME_ELEMENT(SW_KEYPAD_SLIDE),
++    NAME_ELEMENT(SW_FRONT_PROXIMITY),
++#endif
++#ifdef SW_ROTATE_LOCK
++    NAME_ELEMENT(SW_ROTATE_LOCK),
++#endif
++};
++
++static const char *const force[FF_MAX + 1] = {
++    [0 ... FF_MAX] = NULL,
++    NAME_ELEMENT(FF_RUMBLE), NAME_ELEMENT(FF_PERIODIC),
++    NAME_ELEMENT(FF_CONSTANT), NAME_ELEMENT(FF_SPRING),
++    NAME_ELEMENT(FF_FRICTION), NAME_ELEMENT(FF_DAMPER),
++    NAME_ELEMENT(FF_INERTIA), NAME_ELEMENT(FF_RAMP),
++    NAME_ELEMENT(FF_SQUARE), NAME_ELEMENT(FF_TRIANGLE),
++    NAME_ELEMENT(FF_SINE), NAME_ELEMENT(FF_SAW_UP),
++    NAME_ELEMENT(FF_SAW_DOWN), NAME_ELEMENT(FF_CUSTOM),
++    NAME_ELEMENT(FF_GAIN), NAME_ELEMENT(FF_AUTOCENTER),
++};
++
++static const char *const forcestatus[FF_STATUS_MAX + 1] = {
++    [0 ... FF_STATUS_MAX] = NULL,
++    NAME_ELEMENT(FF_STATUS_STOPPED), NAME_ELEMENT(FF_STATUS_PLAYING),
++};
++
++static const char *const *const names[EV_MAX + 1] = {
++    [0 ... EV_MAX] = NULL,
++    [EV_SYN] = events,
++    [EV_KEY] = keys,
++    [EV_REL] = relatives,
++    [EV_ABS] = absolutes,
++    [EV_MSC] = misc,
++    [EV_LED] = leds,
++    [EV_SND] = sounds,
++    [EV_REP] = repeats,
++    [EV_SW] = switches,
++    [EV_FF] = force,
++    [EV_FF_STATUS] = forcestatus,
++};
++
++static const char *ev_types[EV_MAX + 1] = {
++    [0 ... EV_MAX] = NULL,
++    NAME_ELEMENT(EV_SYN), NAME_ELEMENT(EV_KEY),
++    NAME_ELEMENT(EV_REL), NAME_ELEMENT(EV_ABS),
++    NAME_ELEMENT(EV_ABS), NAME_ELEMENT(EV_MSC),
++    NAME_ELEMENT(EV_SW), NAME_ELEMENT(EV_LED),
++    NAME_ELEMENT(EV_SND), NAME_ELEMENT(EV_REP),
++    NAME_ELEMENT(EV_FF), NAME_ELEMENT(EV_PWR),
++    NAME_ELEMENT(EV_FF_STATUS)
++};
++
++/**
++ * Grab and immediately ungrab the device.
++ *
++ * @param fd The file descriptor to the device.
++ * @return 0 if the grab was successful, or 1 otherwise.
++ */
++static int test_grab(int fd)
++{
++    int rc;
++
++    rc = ioctl(fd, EVIOCGRAB, (void *)1);
++
++    if (!rc)
++        ioctl(fd, EVIOCGRAB, (void *)0);
++
++    return rc;
++}
++
++/**
++ * Filter for the AutoDevProbe scandir on /dev/input.
++ *
++ * @param dir The current directory entry provided by scandir.
++ *
++ * @return Non-zero if the given directory entry starts with "event", or zero
++ * otherwise.
++ */
++static int is_event_device(const struct dirent *dir)
++{
++    return strncmp("event", dir->d_name, 5) == 0;
++}
++
++typedef struct QipsEventDevice {
++    int fd;
++    pthread_t thread;
++    const char *name;
++    const char *path;
++     QTAILQ_ENTRY(QipsEventDevice) next;
++} QipsEventDevice;
++
++typedef QTAILQ_HEAD(QipsEventDeviceList, QipsEventDevice) QipsEventDeviceList;
++
++static QipsEventDeviceList devices = QTAILQ_HEAD_INITIALIZER(devices);
++static QemuMutex devices_mutex;
++
++static void evdev_list_add(QipsEventDevice * device)
++{
++    DPRINTF("adding evdev name=%s path=%s...\n", device->name, device->path);
++    qemu_mutex_lock(&devices_mutex);
++    QTAILQ_INSERT_TAIL(&devices, device, next);
++    qemu_mutex_unlock(&devices_mutex);
++}
++
++static void evdev_list_remove(QipsEventDevice * device)
++{
++    DPRINTF("removing evdev name=%s path=%s...\n", device->name, device->path);
++    qemu_mutex_lock(&devices_mutex);
++    QTAILQ_REMOVE(&devices, device, next);
++    qemu_mutex_unlock(&devices_mutex);
++}
++
++/*
++static void evdev_list_remove_by_fd(int fd)
++{
++    QipsEventDevice *device = NULL, *tmp = NULL;
++
++    DPRINTF("removing evdev fd=%d...\n", fd);
++
++    QTAILQ_FOREACH_SAFE(device, &devices, next, tmp) {
++        if (device->fd == fd) {
++            evdev_list_remove(device);
++            return;
++        }
++    }
++}
++*/
++
++static void process_event(struct input_event *ev)
++{
++    QipsMouseButtons mouse_buttons = { false, false, false };
++    bool mouse_buttons_pkt = false;
++
++    EVDEV_DPRINTF("ev->time: %ld.%06ld\n", ev->time.tv_sec, ev->time.tv_usec);
++    EVDEV_DPRINTF("ev->type: %s (0x%x)\n", ev_types[ev->type], ev->type);
++    EVDEV_DPRINTF("ev->code: %s (0x%x)\n", names[ev->type][ev->code], ev->code);
++
++    if (ev->type == EV_KEY) {
++        switch (ev->value) {
++        case 0:
++            EVDEV_DPRINTF("ev->value: KEY_RELEASED (%d)\n", ev->value);
++            break;
++        case 1:
++            EVDEV_DPRINTF("ev->value: KEY_DEPRESSED (%d)\n", ev->value);
++            break;
++        case 2:
++            EVDEV_DPRINTF("ev->value: KEY_REPEAT (%d)\n", ev->value);
++            break;
++        case 3:
++            EVDEV_DPRINTF("ev->value: KEY_WTF (%d)\n", ev->value);
++            break;
++        }
++
++        switch (ev->code) {
++        case BTN_LEFT:
++            mouse_buttons_pkt = true;
++            if (ev->value == 0) {
++                mouse_buttons.left = false;
++            } else if (ev->value == 1) {
++                mouse_buttons.left = true;
++            }
++
++            break;
++        case BTN_MIDDLE:
++            mouse_buttons_pkt = true;
++            if (ev->value == 0) {
++                mouse_buttons.middle = false;
++            } else if (ev->value == 1) {
++                mouse_buttons.middle = true;
++            }
++
++            break;
++        case BTN_RIGHT:
++            mouse_buttons_pkt = true;
++            if (ev->value == 0) {
++                mouse_buttons.right = false;
++            } else if (ev->value == 1) {
++                mouse_buttons.right = true;
++            }
++
++            break;
++        }
++
++        if (mouse_buttons_pkt) {
++            // mouse button packet
++            qips_input_backend_rel_mouse_event(timestamp_usec(ev->time), 0,
++                                               0, 0, &mouse_buttons);
++        } else {
++            uint8_t scancode = 0;
++
++            if (ev->code >= KEY_MAX) {
++                EVDEV_DPRINTF("warning code=0x%x exceeds KEY_MAX!\n", ev->code);
++                return;
++            }
++
++            scancode = evdev_keycode_to_pc_keycode[ev->code];
++
++            EVDEV_DPRINTF("code=0x%x -> scancode=0x%x\n", ev->code, scancode);
++
++            if (scancode) {
++                qips_input_backend_key_event(timestamp_usec(ev->time),
++                                             scancode, ev->value);
++            }
++        }
++    } else if (ev->type == EV_MSC
++               && (ev->code == MSC_RAW || ev->code == MSC_SCAN)) {
++        EVDEV_DPRINTF("ev->value: 0x%x\n", ev->value);
++    } else if (ev->type == EV_REL) {
++        int dx = 0, dy = 0, dz = 0;
++
++        if (ev->code == REL_X) {
++            dx = ev->value;
++        } else if (ev->code == REL_Y) {
++            dy = ev->value;
++        } else if (ev->code == REL_WHEEL) {
++            dz = -ev->value;
++        } else {
++            //
++        }
++
++        qips_input_backend_rel_mouse_event(timestamp_usec(ev->time), dx, dy,
++                                           dz, &mouse_buttons);
++
++        EVDEV_DPRINTF("ev->value: %d\n", ev->value);
++    }
++
++    EVDEV_DPRINTF("\n");
++}
++
++static void *device_thread(void *d)
++{
++    QipsEventDevice *device = (QipsEventDevice *) d;
++
++    struct input_event last_packet;
++    int hacked_pkt_count = 0;
++
++    while (1) {
++        struct input_event ev_data[64];
++        ssize_t bytes_read;
++        int i;
++        
++        bytes_read = read(device->fd, &ev_data, sizeof(ev_data));
++
++        if (bytes_read < sizeof(struct input_event)) {
++            DPRINTF("failed to read from device!\n");
++            evdev_list_remove(device);
++            return NULL;
++        }
++
++        if (bytes_read % sizeof(struct input_event) != 0) {
++            DPRINTF("evdev read not aligned to struct size? dropping...\n");
++            evdev_list_remove(device);
++            return NULL;
++        }
++
++        for (i = 0; i < (bytes_read / sizeof(struct input_event)); i++) {
++            struct input_event *ev = &ev_data[i];
++
++            /* XXX: hack until switch to udev - basically read()
++               will keep spitting out the same packet data endlessly */
++            if (memcmp(&last_packet, ev, sizeof(struct input_event)) == 0) {
++                if (++hacked_pkt_count > 100) {
++                    DPRINTF("100 repeated packets - dropping device!\n");
++                    evdev_list_remove(device);
++                    return NULL;
++                }
++            } else {
++                memcpy(&last_packet, ev, sizeof(struct input_event));
++                hacked_pkt_count = 0;
++                process_event(ev);
++            }
++
++            /* XXX: optimize to consolidate grouped data (e.g. sum relatives) */
++        }
++    }
++
++    return NULL;
++}
++
++static bool add_event_device(int fd, const char *name, const char *path)
++{
++    size_t len;
++    char *device_name, *device_path;
++    QipsEventDevice *device, *tmp;
++
++    DPRINTF("adding evdev fd=%d...\n", fd);
++
++    /* quick sanity check to make sure device doesn't already exist */
++    QTAILQ_FOREACH_SAFE(device, &devices, next, tmp) {
++        if (strcmp(path, device->path) == 0 && strcmp(name, device->name) == 0) {
++
++            /* XXX: do a further check and make sure the old one is stale */
++            DPRINTF("possible duplicate evdev name=%s path=%s fd=%d v fd=%d?\n",
++                    name, path, fd, device->fd);
++        }
++    }
++
++    device = g_malloc0(sizeof(QipsEventDevice));
++
++    len = strlen(name) + 1;
++    device_name = g_malloc0(len);
++    pstrcpy(device_name, len, name);
++
++    len = strlen(path) + 1;
++    device_path = g_malloc0(len);
++    pstrcpy(device_path, len, path);
++
++    device->fd = fd;
++    device->name = device_name;
++    device->path = device_path;
++
++    pthread_create(&device->thread, NULL, device_thread, device);
++
++    evdev_list_add(device);
++
++    return -1;
++}
++
++static bool check_event_device(const char *path)
++{
++    int fd;
++    const char name[PATH_MAX];
++
++    DPRINTF("checking event device: %s\n", path);
++
++    if (strncmp("/dev/input/event", path, sizeof("/dev/input/event") - 1)) {
++        DPRINTF("not an input device, skipping...");
++        return false;
++    }
++
++    fd = open(path, O_RDONLY);
++
++    if (fd < 0) {
++        DPRINTF("unable to open %s:	%s\n", path, name);
++        return false;
++    }
++
++    ioctl(fd, EVIOCGNAME(sizeof(name)), name);
++
++    DPRINTF("adding %s:	%s\n", path, name);
++
++    if (test_grab(fd) == 0) {
++        DPRINTF("adding %s:	%s\n", path, name);
++        if (add_event_device(fd, name, path) == true) {
++            return true;
++        }
++    } else {
++        DPRINTF("unable to grab %s:	%s\n", path, name);
++    }
++
++    close(fd);
++
++    return false;
++}
++
++/**
++ * Scans all /dev/input/event*, tries to grab them and adds them to the list.
++ * XXX: a poor way of doing this - need to switch to udev monitoring
++ *
++ * @return The number of devices added.
++ */
++static int scan_devices(void)
++{
++    struct dirent **namelist;
++    int i, ndev;
++    int ndev_added = 0;
++
++    ndev = scandir("/dev/input", &namelist, is_event_device, alphasort);
++
++    if (ndev <= 0) {
++        return 0;
++    }
++
++    DPRINTF("checking devices:\n");
++
++    for (i = 0; i < ndev; i++) {
++        char fname[PATH_MAX];
++
++        snprintf(fname, sizeof(fname),
++                 "%s/%s", "/dev/input", namelist[i]->d_name);
++
++        check_event_device(fname);
++
++        free(namelist[i]);
++    }
++
++    return ndev_added;
++}
++
++/* XXX: a terrible way of doing this - need to switch to udev monitoring */
++static void *evdev_notify(void *unused)
++{
++    int fd, wd;
++
++    /* initalize inotify */
++    fd = inotify_init();
++
++    if (fd < 0) {
++        DPRINTF("inotify_init() error: %s\n", strerror(errno));
++        return NULL;
++    }
++
++    /* add watch for /var/run/qemu-iss */
++    wd = inotify_add_watch(fd, "/dev/input", IN_CREATE | IN_DELETE);
++
++    while (1) {
++        char event_buffer[sizeof(struct inotify_event) + NAME_MAX + 1];
++        char full_path[PATH_MAX + 1];
++        struct inotify_event *event;
++        int length;
++
++        length = read(fd, event_buffer, sizeof(event_buffer));
++
++        if (length < 0) {
++            DPRINTF("inotify read() error: %s\n", strerror(errno));
++            return NULL;
++        }
++
++        event = (struct inotify_event *)event_buffer;
++
++        if (!event->len) {
++            DPRINTF("warning: name is zero bytes?\n");
++            continue;
++        }
++
++        /* determine full path */
++        snprintf(full_path, sizeof(full_path), "/dev/input/%s", event->name);
++
++        if (event->mask & IN_CREATE) {
++            if (event->mask & IN_ISDIR) {
++                DPRINTF("detected new directory: %s\n", full_path);
++            } else {
++                DPRINTF("detected new file: %s\n", full_path);
++                check_event_device(full_path);
++            }
++        } else if (event->mask & IN_DELETE) {
++            if (event->mask & IN_ISDIR) {
++                DPRINTF("detected deleted directory: %s\n", full_path);
++            } else {
++                DPRINTF("detected deleted file: %s\n", full_path);
++            }
++        }
++    }
++
++    /* cleanup */
++    inotify_rm_watch(fd, wd);
++    close(fd);
++    return NULL;
++}
++
++static bool evdev_init(void)
++{
++    DPRINTF("evdev_init: called!\n");
++    qemu_mutex_init(&devices_mutex);
++    scan_devices();
++    pthread_create(&evdev_inotify_thread, NULL, evdev_notify, NULL);
++    return true;
++}
++
++static bool evdev_cleanup(void)
++{
++    DPRINTF("evdev_cleanup: called!\n");
++    return true;
++}
++
++static const QipsInputBackend evdev = {
++    .init = evdev_init,
++    .cleanup = evdev_cleanup,
++};
++
++const QipsInputBackend *evdev_input_backend_register(void)
++{
++    qips_input_backend_register(&evdev);
++
++    return &evdev;
++}
+diff --git a/tools/qemu-xen/qips/input-backend/evdev.h b/tools/qemu-xen/qips/input-backend/evdev.h
+new file mode 100644
+index 0000000..2ac22fe
+--- /dev/null
++++ b/tools/qemu-xen/qips/input-backend/evdev.h
+@@ -0,0 +1,25 @@
++/*
++ * Copyright (c) 2013 Chris Patterson <cjp256@gmail.com>
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
++ *
++ */
++
++#ifndef QIPS_INPUT_BACKEND_EVDEV_H
++#define QIPS_INPUT_BACKEND_EVDEV_H
++
++const QipsInputBackend *evdev_input_backend_register(void);
++
++#endif
+diff --git a/tools/qemu-xen/qips/input-backend/input-backend.c b/tools/qemu-xen/qips/input-backend/input-backend.c
+new file mode 100644
+index 0000000..f826a99
+--- /dev/null
++++ b/tools/qemu-xen/qips/input-backend/input-backend.c
+@@ -0,0 +1,150 @@
++/*
++ * Copyright (c) 2013 Chris Patterson <cjp256@gmail.com>
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
++ *
++ */
++
++#include "input-backend.h"
++#include "ui/keymaps.h"
++#include "console.h"
++
++#define INPUT_DPRINTF(msg, ...) do { \
++    if (input_backend_debug_mode) fprintf(stderr, "%s():L%d: " msg "\n", \
++            __FUNCTION__, __LINE__, ## __VA_ARGS__); \
++} while(0)
++
++static uint8_t key_down_map[256] = { 0, };
++
++static const QipsInputBackend *input_backend = NULL;
++
++void qips_input_backend_register(const QipsInputBackend * backend)
++{
++    input_backend = backend;
++}
++
++bool qips_input_backend_init(void)
++{
++    return input_backend->init();
++}
++
++bool qips_input_backend_cleanup(void)
++{
++    return input_backend->cleanup();
++}
++
++#if 0
++static void qips_input_backend_dump_key_map(void)
++{
++    int i;
++
++    fprintf(stderr, "key map down:\n");
++
++    for (i = 0; i < 256; i++) {
++        if (key_down_map[i]) {
++            fprintf(stderr, "( %d -- 0x%x) ", i, i);
++        }
++    }
++
++    fprintf(stderr, "\nmodifiers:\n");
++
++}
++#endif
++
++static void qips_input_backend_key_map(int scancode, int key_status)
++{
++    switch (key_status) {
++    case 0:
++        INPUT_DPRINTF("KEY_RELEASED (%d)\n", scancode);
++        key_down_map[scancode & SCANCODE_KEYMASK] = 0;
++        break;
++    case 1:
++        INPUT_DPRINTF("KEY_DEPRESSED (%d)\n", scancode);
++        key_down_map[scancode & SCANCODE_KEYMASK] = 1;
++        break;
++    case 2:
++        INPUT_DPRINTF("KEY_REPEAT (%d)\n", scancode);
++        key_down_map[scancode & SCANCODE_KEYMASK] = 1;
++        break;
++    case 3:
++        DPRINTF("KEY_WTF (%d)\n", scancode);
++        return;
++    }
++
++    /* Check magic keys (left ctrl + left alt + left/right) */
++    if (key_down_map[0x1d] && key_down_map[0x38] && key_down_map[0xcb]) {
++        DPRINTF("switch left detected\n");
++        qips_domain_switch_left();
++        return;
++    }
++
++    if (key_down_map[0x1d] && key_down_map[0x38] && key_down_map[0xcd]) {
++        DPRINTF("switch right detected\n");
++        qips_domain_switch_right();
++        return;
++    }
++}
++
++void qips_input_backend_key_event(int64_t timestamp_usec,
++                                  int scancode, int key_status)
++{
++    char buf[1024];
++
++    snprintf(buf, sizeof(buf),
++             "{ \"execute\": \"send-keycode\", \"arguments\": { \"keycode\": %d, \"released\": %s } }\r\n",
++             scancode, (key_status == 0) ? "true" : "false");
++
++    qips_send_focused_client_message(buf, strlen(buf), false);
++
++    qips_input_backend_key_map(scancode, key_status);
++}
++
++void qips_input_backend_abs_mouse_event(int64_t timestamp_usec,
++                                        int x, int y, int z,
++                                        QipsMouseButtons * buttons)
++{
++    char buf[1024];
++
++    snprintf(buf, sizeof(buf),
++             "{ \"execute\": \"send-mouse-abs\","
++             " \"arguments\": { \"x\": %d, \"y\": %d, \"z\": %d,"
++             " \"buttons\": { \"left\": %s, \"middle\": %s,"
++             " \"right\": %s } } }\r\n",
++             x, y, z,
++             buttons->left ? "true" : "false",
++             buttons->middle ? "true" : "false",
++             buttons->right ? "true" : "false");
++
++    qips_send_focused_client_message(buf, strlen(buf), false);
++}
++
++void qips_input_backend_rel_mouse_event(int64_t timestamp_usec,
++                                        int dx, int dy, int dz,
++                                        QipsMouseButtons * buttons)
++{
++    char buf[1024];
++
++    snprintf(buf, sizeof(buf),
++             "{ \"execute\": \"send-mouse-rel\","
++             " \"arguments\": { \"dx\": %d, \"dy\": %d, \"dz\": %d,"
++             " \"buttons\": { \"left\": %s, \"middle\": %s,"
++             " \"right\": %s } } }\r\n",
++             dx, dy, dz,
++             buttons->left ? "true" : "false",
++             buttons->middle ? "true" : "false",
++             buttons->right ? "true" : "false");
++
++    qips_send_focused_client_message(buf, strlen(buf), false);
++}
+diff --git a/tools/qemu-xen/qips/input-backend/input-backend.h b/tools/qemu-xen/qips/input-backend/input-backend.h
+new file mode 100644
+index 0000000..e30ebdd
+--- /dev/null
++++ b/tools/qemu-xen/qips/input-backend/input-backend.h
+@@ -0,0 +1,65 @@
++/*
++ * Copyright (c) 2013 Chris Patterson <cjp256@gmail.com>
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
++ *
++ */
++
++#ifndef QIPS_INPUT_BACKEND_H
++#define QIPS_INPUT_BACKEND_H
++
++#include <stdbool.h>
++#include <stdio.h>
++#include <stdint.h>
++#include "qips/qips.h"
++
++typedef struct QipsMouseButtons {
++    bool left;
++    bool middle;
++    bool right;
++} QipsMouseButtons;
++
++typedef struct {
++    bool(*init) (void);
++    bool(*cleanup) (void);
++} QipsInputBackend;
++
++void qips_input_backend_register(const QipsInputBackend * backend);
++
++bool qips_input_backend_init(void);
++
++bool qips_input_backend_cleanup(void);
++
++void qips_input_backend_key_event(int64_t timestamp_usec,
++                                  int scancode, int key_status);
++
++void qips_input_backend_abs_mouse_event(int64_t timestamp_usec,
++                                        int x, int y, int z,
++                                        QipsMouseButtons * buttons);
++
++void qips_input_backend_rel_mouse_event(int64_t timestamp_usec,
++                                        int dx, int dy, int dz,
++                                        QipsMouseButtons * buttons);
++
++void qips_send_focused_client_message(char *msg, size_t sz, bool sync);
++
++void qips_domain_switch_right(void);
++
++void qips_domain_switch_left(void);
++
++extern int input_backend_debug_mode;
++extern int evdev_debug_mode;
++
++#endif
+diff --git a/tools/qemu-xen/qips/qips.c b/tools/qemu-xen/qips/qips.c
+new file mode 100644
+index 0000000..11cd0b2
+--- /dev/null
++++ b/tools/qemu-xen/qips/qips.c
+@@ -0,0 +1,974 @@
++/*
++ * Copyright (c) 2013 Chris Patterson <cjp256@gmail.com>
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
++ *
++ */
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++#include <errno.h>
++#include <fcntl.h>
++#include <dirent.h>
++#include <linux/input.h>
++#include <sys/types.h>
++#include <sys/stat.h>
++#include <sys/select.h>
++#include <sys/time.h>
++#include <termios.h>
++#include <signal.h>
++#include <sys/socket.h>
++#include <sys/un.h>
++#include <pthread.h>
++#include <sys/inotify.h>
++
++#include "../qemu-common.h"
++#include "qlist.h"
++#include "qint.h"
++#include "qbool.h"
++#include "qfloat.h"
++#include "qdict.h"
++#include "qemu-thread.h"
++#include "input-backend/input-backend.h"
++#include "input-backend/evdev.h"
++#include "console-backend/console-backend.h"
++#include "console-backend/vt.h"
++#include "console-frontend/console-frontend.h"
++#include "console-frontend/xengt.h"
++#include "ui/x_keymap.h"
++#include "json-streamer.h"
++#include "json-parser.h"
++#include "qips.h"
++
++int evdev_debug_mode = 0;
++int input_backend_debug_mode = 0;
++int qips_debug_mode = 0;
++
++#define QIPS_SOCKETS_PATH "/var/run/qips"
++#define QIPS_SOCKETS_FMT "/var/run/qips/slot-%d"
++#define QIPS_SOCKETS_FMT_BASE "slot-"
++
++typedef struct QipsClient {
++    char socket_path[PATH_MAX];
++    int socket_fd;
++    int domain_id;
++    int slot_id;
++    int led_state;
++    int msg_recv_count;
++    int msg_sent_count;
++    bool mouse_mode_absolute;
++     QTAILQ_ENTRY(QipsClient) next;
++    pthread_t socket_listener;
++    JSONMessageParser inbound_parser;
++} QipsClient;
++
++typedef QTAILQ_HEAD(QipsClientList, QipsClient) QipsClientList;
++
++typedef struct QipsState {
++    bool do_quit;
++
++    QemuMutex clients_mutex;
++    QipsClientList clients;
++    QipsClient *focused_client;
++
++    const QipsInputBackend *input_backend;
++    const QipsConsoleBackend *console_backend;
++    const QipsConsoleFrontend *console_frontend;
++} QipsState;
++
++static QipsState state = {
++    .do_quit = false,
++    .clients = QTAILQ_HEAD_INITIALIZER(state.clients),
++    .focused_client = NULL,
++};
++
++static void qips_request_kbd_reset(QipsState * s, QipsClient * client);
++
++static void switch_focused_client(QipsState * s, QipsClient * new_focus,
++                                  bool teardown)
++{
++    QipsClient *old_focus = s->focused_client;
++
++    if (new_focus == NULL) {
++        DPRINTF("warning new_focus is NULL!\n");
++        return;
++    }
++
++    DPRINTF("new focus=%p slot=%d\n", new_focus, new_focus->slot_id);
++    DPRINTF("old focus=%p slot=%d\n", old_focus, old_focus->slot_id);
++
++    /* if tearing down - we don't care about state */
++    if (!teardown) {
++        /* send a keyboard reset to bring up any keys that may have been down */
++        qips_request_kbd_reset(s, old_focus);
++    }
++
++    /* lock console backend if switching from domain-0 */
++    if (s->focused_client->domain_id == 0) {
++        s->console_backend->lock();
++    }
++
++    s->focused_client = new_focus;
++
++    /* update console frontend */
++    s->console_frontend->domain_switch(new_focus->domain_id);
++
++    /* release lock on console backend if switching to domain-0 */
++    if (new_focus->domain_id == 0) {
++        s->console_backend->release();
++    }
++
++    /* update leds */
++    DPRINTF("attempting to update led state to 0x%x\n", new_focus->led_state);
++    s->console_backend->set_ledstate(new_focus->led_state);
++}
++
++void qips_domain_switch_right(void)
++{
++    QipsState *s = &state;
++
++    QipsClient *new_focus = QTAILQ_NEXT(s->focused_client, next);
++
++    if (new_focus == NULL) {
++        /* end of list - go back to top */
++        DPRINTF("end of list, moving back to top\n");
++        new_focus = QTAILQ_FIRST(&s->clients);
++    }
++
++    DPRINTF("new focus=%p, old focus=%p\n", new_focus, s->focused_client);
++
++    switch_focused_client(s, new_focus, false);
++}
++
++void qips_domain_switch_left(void)
++{
++    QipsState *s = &state;
++
++    QipsClient *new_focus =
++        QTAILQ_PREV(s->focused_client, QipsClientList, next);
++
++    if (new_focus == NULL) {
++        /* top of the list - loop back to tail */
++        DPRINTF("top of list, moving back to end");
++        new_focus = QTAILQ_LAST(&s->clients, QipsClientList);
++    }
++
++    DPRINTF("new focus=%p, old focus=%p\n", new_focus, s->focused_client);
++
++    switch_focused_client(s, new_focus, false);
++}
++
++static void client_list_mutex_init(QipsState * s)
++{
++    qemu_mutex_init(&s->clients_mutex);
++}
++
++static void client_list_mutex_lock(QipsState * s)
++{
++    qemu_mutex_lock(&s->clients_mutex);
++}
++
++static void client_list_mutex_unlock(QipsState * s)
++{
++    qemu_mutex_unlock(&s->clients_mutex);
++}
++
++static void client_list_add(QipsState * s, QipsClient * client)
++{
++    QipsClient *iter;
++
++    DPRINTF("adding client slot id=%d...\n", client->slot_id);
++
++    /* we want to add the client in order of slot id to simply switches */
++
++    client_list_mutex_lock(s);
++    QTAILQ_FOREACH(iter, &s->clients, next) {
++        if (iter->slot_id > client->slot_id) {
++            QTAILQ_INSERT_BEFORE(iter, client, next);
++            client_list_mutex_unlock(s);
++            return;
++        }
++
++        /* XXX: shouldn't happen - but if there is a race, allow add _after_
++           existing entry if delete is racing (and losing) */
++        if (iter->slot_id == client->slot_id) {
++            DPRINTF("WARNING: re-adding slot id=%d...?\n", client->slot_id);
++            QTAILQ_INSERT_AFTER(&s->clients, iter, client, next);
++            client_list_mutex_unlock(s);
++            return;
++        }
++    }
++
++    /* no larger slot id was found - add to tail */
++    QTAILQ_INSERT_TAIL(&s->clients, client, next);
++    client_list_mutex_unlock(s);
++}
++
++static void client_list_remove(QipsState * s, QipsClient * client)
++{
++    if (client->slot_id == 0 || client->domain_id == 0) {
++        return;
++    }
++
++    DPRINTF("removing client slot id=%d...\n", client->slot_id);
++
++    /* check if removing focused client - switch to head/dom0 if so */
++    if (client == s->focused_client) {
++        switch_focused_client(s, QTAILQ_FIRST(&s->clients), true);
++    }
++
++    client_list_mutex_lock(s);
++    QTAILQ_REMOVE(&s->clients, client, next);
++    client_list_mutex_unlock(s);
++}
++
++static void qips_cleanup(QipsState * s)
++{
++    QipsClient *client = NULL, *tmp = NULL;
++
++    DPRINTF("starting cleanup...\n");
++
++    QTAILQ_FOREACH_SAFE(client, &s->clients, next, tmp) {
++        if (client->socket_fd >= 0) {
++            close(client->socket_fd);
++            DPRINTF("closed fd=%d...\n", client->socket_fd);
++        }
++
++        /* remove if not dom0 */
++        if (client->domain_id != 0) {
++            client_list_remove(s, client);
++        }
++    }
++
++    /* switch back to dom0 */
++    s->console_frontend->domain_switch(0);
++
++    /* release lock on dom0 */
++    s->console_backend->release();
++
++    s->console_frontend->cleanup();
++    s->console_backend->cleanup();
++    s->input_backend->cleanup();
++
++    DPRINTF("complete...\n");
++}
++
++static void qips_send_message(QipsState * s, QipsClient * client, char *msg,
++                              size_t sz, bool sync)
++{
++    int sent_count, recv_count;
++
++    if (!client) {
++        DPRINTF(" noone is listening :(\n");
++        return;
++    }
++
++    if (client->slot_id == 0) {
++        /* do nothing with dom0 events */
++        return;
++    }
++
++    DPRINTF("sending msg to client slot=%d domain=%d (fd=%d)\n",
++            client->slot_id, client->domain_id, client->socket_fd);
++
++    DPRINTF("msg = %s\n", msg);
++
++    if (sz != strlen(msg)) {
++        DPRINTF("WARNING msg sz %zd != strlen(msg) %zd \n", sz, strlen(msg));
++    }
++
++    if (client->socket_fd <= 0) {
++        DPRINTF("warning invalid descriptor - ignoring packet!\n");
++        return;
++    }
++
++    recv_count = client->msg_recv_count;
++
++    if (send(client->socket_fd, msg, strlen(msg), 0) < 0) {
++        DPRINTF
++            ("send error - closing client domain=%d (fd=%d)\n",
++             client->domain_id, client->socket_fd);
++        client->socket_fd = -1;
++        client_list_remove(s, client);
++        return;
++    }
++
++    sent_count = ++client->msg_sent_count;
++
++    DPRINTF("recv=%d sent=%d", recv_count, sent_count);
++
++    /* XXX - perhaps use id? */
++    if (sync) {
++        DPRINTF("attempting to sync!\n");
++        while (client->msg_recv_count == recv_count) {
++            usleep(1);
++        }
++        DPRINTF("synced!\n");
++    }
++}
++
++static void qips_send_hello(QipsState * s, QipsClient * client)
++{
++    char hello[] = "{ \"execute\": \"qmp_capabilities\" }";
++
++    DPRINTF("sending hello to client slot=%d domain=%d (fd=%d)\n",
++            client->slot_id, client->domain_id, client->socket_fd);
++
++    qips_send_message(s, client, hello, strlen(hello), false);
++}
++
++static void qips_send_xen_query(QipsState * s, QipsClient * client)
++{
++    char query[] = "{ \"execute\": \"query-xen-status\" }";
++
++    DPRINTF("sending xen query to client slot=%d domain=%d (fd=%d)\n",
++            client->slot_id, client->domain_id, client->socket_fd);
++
++    qips_send_message(s, client, query, strlen(query), false);
++}
++
++static void qips_request_kbd_leds(QipsState * s, QipsClient * client)
++{
++    char query[] = "{ \"execute\": \"query-kbd-leds\" }\r\n";
++
++    DPRINTF("sending kbd leds query to client slot=%d domain=%d (fd=%d)\n",
++            client->slot_id, client->domain_id, client->socket_fd);
++
++    qips_send_message(s, client, query, strlen(query), false);
++}
++
++static void qips_request_kbd_reset(QipsState * s, QipsClient * client)
++{
++    char query[] = "{ \"execute\": \"send-kbd-reset\" }\r\n";
++
++    DPRINTF("sending kbd reset to client slot=%d domain=%d (fd=%d)\n",
++            client->slot_id, client->domain_id, client->socket_fd);
++
++    qips_send_message(s, client, query, strlen(query), false);
++}
++
++void qips_send_focused_client_message(char *msg, size_t sz, bool sync)
++{
++    qips_send_message(&state, state.focused_client, msg, sz, sync);
++}
++
++static void terminate(int signum)
++{
++    DPRINTF("SIGTERM!\n");
++
++    qips_cleanup(&state);
++
++    exit(5);
++}
++
++static void setup_signals(void)
++{
++    struct sigaction sa;
++
++    /* ignore most signals... */
++    sigemptyset(&(sa.sa_mask));
++    sa.sa_flags = SA_RESTART;
++    sa.sa_handler = SIG_IGN;
++    sigaction(SIGHUP, &sa, 0);
++    sigaction(SIGINT, &sa, 0);
++    sigaction(SIGQUIT, &sa, 0);
++    sigaction(SIGPIPE, &sa, 0);
++    sigaction(SIGALRM, &sa, 0);
++    sigaction(SIGTSTP, &sa, 0);
++    sigaction(SIGTTIN, &sa, 0);
++    sigaction(SIGTTOU, &sa, 0);
++    sigaction(SIGURG, &sa, 0);
++    sigaction(SIGVTALRM, &sa, 0);
++    sigaction(SIGIO, &sa, 0);
++    sigaction(SIGPWR, &sa, 0);
++
++    /* catch sigterm to exit cleanly... */
++    sa.sa_flags = SA_RESETHAND;
++    sa.sa_handler = terminate;
++    sigaction(SIGTERM, &sa, NULL);
++}
++
++static int is_domain_socket(const struct dirent *dir)
++{
++    return strncmp(QIPS_SOCKETS_FMT_BASE, dir->d_name,
++                   strlen(QIPS_SOCKETS_FMT_BASE)) == 0;
++}
++
++static void process_json_message(JSONMessageParser * parser, QList * tokens);
++static void client_consumer(QipsState * s, QipsClient * client)
++{
++    char buf[4096];
++
++    while (1) {
++        ssize_t sz = read(client->socket_fd, buf, sizeof(buf));
++
++        if (sz < 0) {
++            DPRINTF("failed to read: %s!\n", strerror(errno));
++            break;
++        }
++
++        if (sz > 0) {
++            json_message_parser_feed(&client->inbound_parser,
++                                     (const char *)buf, sz);
++        }
++
++        if (sz == 0) {
++            DPRINTF("client disconnected: %s\n", strerror(errno));
++            break;
++        }
++    }
++
++    /* client is done for - cleanup */
++    DPRINTF("closing client slot=%d\n", client->slot_id);
++    close(client->socket_fd);
++    client->socket_fd = -1;
++    client_list_remove(s, client);
++}
++
++static const char *qtype_names[] = {
++    [QTYPE_NONE] = "QTYPE_NONE",
++    [QTYPE_QSTRING] = "QTYPE_QSTRING",
++    [QTYPE_QDICT] = "QTYPE_QDICT",
++    [QTYPE_QLIST] = "QTYPE_QLIST",
++    [QTYPE_QFLOAT] = "QTYPE_QFLOAT",
++    [QTYPE_QBOOL] = "QTYPE_QBOOL",
++    [QTYPE_QINT] = "QTYPE_QINT",
++    [QTYPE_QERROR] = "QTYPE_QERROR",
++};
++
++static void dump_qobj(int indent_level, QObject * obj)
++{
++    int type;
++    const char *type_name;
++
++    type = qobject_type(obj);
++    type_name = qtype_names[type];
++
++    DPRINTF("%*s{", indent_level, "-");
++    switch (type) {
++    case QTYPE_QSTRING:
++        {
++            const char *str;
++            str = qstring_get_str(qobject_to_qstring(obj));
++            DPRINTF("%*s(%s) %s", indent_level, "-", type_name, str);
++            break;
++        }
++    case QTYPE_QDICT:
++        {
++            const QDictEntry *ent;
++            QDict *qdict = qobject_to_qdict(obj);
++            for (ent = qdict_first(qdict); ent != NULL;
++                 ent = qdict_next(qdict, ent)) {
++                QObject *val = qdict_entry_value(ent);
++                const char *key = qdict_entry_key(ent);
++                DPRINTF("%*s(%s) %s=>", indent_level, "-", type_name, key);
++                dump_qobj(indent_level + 4, val);
++            }
++            break;
++        }
++    case QTYPE_QLIST:
++        {
++            const QListEntry *lent;
++            QList *list = qobject_to_qlist(obj);
++
++            for (lent = qlist_first(list); lent != NULL;
++                 lent = qlist_next(lent)) {
++                dump_qobj(indent_level + 4, lent->value);
++            }
++            break;
++        }
++    case QTYPE_QFLOAT:
++        {
++            double fl = qfloat_get_double(qobject_to_qfloat(obj));
++            DPRINTF("%*s(%s) %e", indent_level, "-", type_name, fl);
++            break;
++        }
++    case QTYPE_QBOOL:
++        {
++            int b = qbool_get_int(qobject_to_qbool(obj));
++            DPRINTF("%*s(%s) %s", indent_level, "-", type_name,
++                    b ? "true" : "false");
++            break;
++        }
++    case QTYPE_QINT:
++        {
++            int i = qint_get_int(qobject_to_qint(obj));
++            DPRINTF("%*s(%s) %d", indent_level, "-", type_name, i);
++            break;
++        }
++    case QTYPE_NONE:
++    default:
++        {
++            DPRINTF("?????");
++            break;
++        }
++    }
++    DPRINTF("%*s}", indent_level, "-");
++}
++
++/* process mouse mode status */
++static void process_mouse_mode_message(QipsClient * client, QDict * dict)
++{
++    DPRINTF("mouse mode status msg client=%p dict=%p\n", client, dict);
++
++    /* mouse mode absolute */
++    if (qdict_haskey(dict, "absolute")) {
++        QObject *obj;
++        obj = qdict_get(dict, "absolute");
++
++        if (qobject_type(obj) == QTYPE_QBOOL) {
++            int abs = qbool_get_int(qobject_to_qbool(obj));
++            client->mouse_mode_absolute = abs;
++            DPRINTF("set client slot=%d to mouse_mode_absolute=%d",
++                    client->slot_id, client->mouse_mode_absolute);
++        } else {
++            DPRINTF("return msg has absolute type mismatch\n");
++        }
++    }
++
++    /* ignore x/y coords */
++}
++
++/* process keyboard leds status */
++static void process_kbd_leds_status_message(QipsClient * client, QDict * dict)
++{
++    DPRINTF("kbd leds status msg client=%p dict=%p\n", client, dict);
++
++    /* caps lock status */
++    if (qdict_haskey(dict, "caps")) {
++        QObject *obj;
++        obj = qdict_get(dict, "caps");
++
++        if (obj && qobject_type(obj) == QTYPE_QBOOL) {
++            int caps = qbool_get_int(qobject_to_qbool(obj));
++            if (caps) {
++                client->led_state |= QEMU_CAPS_LOCK_LED;
++            } else {
++                client->led_state &= ~QEMU_CAPS_LOCK_LED;
++            }
++            DPRINTF("set client slot=%d to caps=%d (0x%x)",
++                    client->slot_id, caps, client->led_state);
++        } else {
++            DPRINTF("kbd led status msg has caps type mismatch\n");
++        }
++    }
++
++    /* scroll lock status */
++    if (qdict_haskey(dict, "scroll")) {
++        QObject *obj;
++        obj = qdict_get(dict, "scroll");
++
++        if (obj && qobject_type(obj) == QTYPE_QBOOL) {
++            int scroll = qbool_get_int(qobject_to_qbool(obj));
++            if (scroll) {
++                client->led_state |= QEMU_SCROLL_LOCK_LED;
++            } else {
++                client->led_state &= ~QEMU_SCROLL_LOCK_LED;
++            }
++            DPRINTF("set client slot=%d to scroll=%d (0x%x)",
++                    client->slot_id, scroll, client->led_state);
++        } else {
++            DPRINTF("kbd led status msg has scroll type mismatch\n");
++        }
++    }
++
++    /* num lock status */
++    if (qdict_haskey(dict, "num")) {
++        QObject *obj;
++        obj = qdict_get(dict, "num");
++
++        if (obj && qobject_type(obj) == QTYPE_QBOOL) {
++            int num = qbool_get_int(qobject_to_qbool(obj));
++            if (num) {
++                client->led_state |= QEMU_NUM_LOCK_LED;
++            } else {
++                client->led_state &= ~QEMU_NUM_LOCK_LED;
++            }
++            DPRINTF("set client slot=%d to num=%d (0x%x)",
++                    client->slot_id, num, client->led_state);
++        } else {
++            DPRINTF("kbd led status msg has num type mismatch\n");
++        }
++    }
++
++    /* update leds if client is current focus */
++    if (client == state.focused_client) {
++        qips_console_backend_set_ledstate(client->led_state);
++    }
++}
++
++/* process xen status */
++static void process_xen_status_message(QipsClient * client, QDict * dict)
++{
++    DPRINTF("xen status msg client=%p dict=%p\n", client, dict);
++
++    /* xen domain id */
++    if (qdict_haskey(dict, "domain")) {
++        QObject *obj;
++        obj = qdict_get(dict, "domain");
++
++        if (qobject_type(obj) == QTYPE_QINT) {
++            int domain;
++            domain = qint_get_int(qobject_to_qint(obj));
++            client->domain_id = domain;
++            DPRINTF("set client slot=%d to domain=%d",
++                    client->slot_id, client->domain_id);
++        } else {
++            DPRINTF("kbd led status msg has domain type mismatch\n");
++        }
++    }
++}
++
++/* process return messages */
++static void process_return_message(QipsClient * client, QDict * dict)
++{
++    DPRINTF("return msg client=%p dict=%p\n", client, dict);
++
++    /* this is a little tricky since you don't have context available here 
++     * unless we fully synchronize send & recv and/or id & track them.
++     * For now, we process all possible return fields as
++     * they are uniquely named for QIP(S) related messages.
++     */
++    process_xen_status_message(client, dict);
++    process_mouse_mode_message(client, dict);
++    process_kbd_leds_status_message(client, dict);
++}
++
++/* process event message given event name and data dictionary */
++static void process_event_message(QipsClient * client, const char *event,
++                                  QDict * data)
++{
++    if (strcmp(event, "QEVENT_QIP_MOUSE_MODE_UPDATE") == 0) {
++        process_mouse_mode_message(client, data);
++    } else if (strcmp(event, "QEVENT_QIP_DISPLAY_MODE_UPDATE") == 0) {
++        /* TODO: not yet implemented on QIP side */
++    } else if (strcmp(event, "QEVENT_QIP_KBD_LEDS_UPDATE") == 0) {
++        process_kbd_leds_status_message(client, data);
++    }
++}
++
++/* handle incoming json message */
++static void process_json_message(JSONMessageParser * parser, QList * tokens)
++{
++    QipsClient *client = container_of(parser, QipsClient, inbound_parser);
++    QObject *obj = NULL;
++    QDict *qdict = NULL;
++
++    Error *err = NULL;
++
++    DPRINTF("processing message...\n");
++
++    client->msg_recv_count++;
++
++    g_assert(client && parser);
++
++    obj = json_parser_parse_err(tokens, NULL, &err);
++
++    dump_qobj(4, obj);
++
++    qdict = qobject_to_qdict(obj);
++
++    if (!qdict) {
++        DPRINTF("json message is not qdict?? - qdict = %p\n", qdict);
++        return;
++    }
++
++    /* check if return message */
++    if (qdict_haskey(qdict, "return")) {
++        QObject *obj = qdict_get(qdict, "return");
++        DPRINTF("has key return - qdict = %p\n", qdict);
++
++        if (obj) {
++            if (qobject_type(obj) == QTYPE_QDICT) {
++                process_return_message(client, qobject_to_qdict(obj));
++                return;
++            } else {
++                DPRINTF("return type mismatch - type=%d\n", qobject_type(obj));
++            }
++        }
++    }
++
++    /* check if event message */
++    if (qdict_haskey(qdict, "event")) {
++        const char *name = qdict_get_try_str(qdict, "event");
++        DPRINTF("has key event - qdict = %p\n", qdict);
++
++        if (name) {
++            QObject *obj = qdict_get(qdict, "data");
++            DPRINTF("event name = %s - data = %p\n", name, obj);
++
++            if (obj) {
++                if (qobject_type(obj) == QTYPE_QDICT) {
++                    process_event_message(client, name, qobject_to_qdict(obj));
++                    return;
++                } else {
++                    DPRINTF("event type mismatch - type=%d\n", qobject_type(obj));
++                }
++            }
++        }
++    }
++}
++
++/* add a client via its own thread because connect() may require some time */
++static void *client_add_thread(void *p)
++{
++    bool connected = false;
++    int retry_count = 5;
++    char *path = (char *)p;
++    QipsState *s = &state;
++    int slot_id = 0;
++    struct sockaddr_un serv_addr;
++    QipsClient *new_client = NULL;
++
++    sscanf(path, QIPS_SOCKETS_FMT, &slot_id);
++
++    DPRINTF("path=%s slot=%d\n", path, slot_id);
++
++    if (slot_id <= 0) {
++        DPRINTF("invalid client with path: %s\n", path);
++        free(path);
++        return NULL;
++    }
++
++    /* register new client */
++    new_client = g_malloc0(sizeof(QipsClient));
++
++    new_client->slot_id = slot_id;
++    pstrcpy(new_client->socket_path, sizeof(new_client->socket_path), path);
++
++    serv_addr.sun_family = AF_UNIX;
++    pstrcpy(serv_addr.sun_path, sizeof(serv_addr.sun_path),
++            new_client->socket_path);
++
++    new_client->socket_fd = socket(AF_UNIX, SOCK_STREAM, 0);
++
++    while (--retry_count) {
++        /* if at first you don't succeed... a race condition here
++           where we try to connect before socket is accepting */
++
++        if (connect(new_client->socket_fd, (const struct sockaddr *)&serv_addr,
++                    sizeof(serv_addr)) == 0) {
++            /* good to go */
++            connected = true;
++            break;
++        }
++
++        DPRINTF("failed to connect to slot_id: %d (%s)\n",
++                new_client->slot_id, strerror(errno));
++
++        sleep(1);
++    }
++
++    if (!connected) {
++        close(new_client->socket_fd);
++        free(new_client);
++        free(path);
++        return NULL;
++    }
++
++    DPRINTF("connected new client at %s with slot=%d\n",
++            new_client->socket_path, new_client->slot_id);
++
++    new_client->socket_listener = pthread_self();
++
++    json_message_parser_init(&new_client->inbound_parser, process_json_message);
++
++    client_list_add(s, new_client);
++
++    qips_send_hello(s, new_client);
++
++    /* XXX: ugly hack because we can't sync on read thread... */
++    sleep(1);
++
++    qips_send_xen_query(s, new_client);
++
++    qips_request_kbd_leds(s, new_client);
++
++    client_consumer(s, new_client);
++
++    return NULL;
++}
++
++static void client_notify(QipsState * s)
++{
++    int fd, wd;
++
++    /* initalize inotify */
++    fd = inotify_init();
++
++    if (fd < 0) {
++        DPRINTF("inotify_init() error: %s\n", strerror(errno));
++        return;
++    }
++
++    /* add watch for /var/run/qemu-iss */
++    wd = inotify_add_watch(fd, QIPS_SOCKETS_PATH, IN_CREATE | IN_DELETE);
++
++    while (1) {
++        /* need to get multiple events at a time or risk losing them */
++        char event_buffer[16 * (sizeof(struct inotify_event) + NAME_MAX + 1)];
++        char full_path[PATH_MAX + 1];
++        struct inotify_event *event;
++        int length;
++        int b = 0;
++
++        length = read(fd, event_buffer, sizeof(event_buffer));
++
++        if (length < 0) {
++            DPRINTF("inotify read() error: %s\n", strerror(errno));
++            return;
++        }
++
++        event = (struct inotify_event *)event_buffer;
++
++        for (b = 0; b < length; b += sizeof(struct inotify_event) + event->len) {
++            event = (struct inotify_event *)&event_buffer[b];
++
++            if (!event->len) {
++                DPRINTF("warning: name is zero bytes?\n");
++                continue;
++            }
++
++            if ((b + sizeof(struct inotify_event) + event->len) > length) {
++                DPRINTF("warning: partial event?\n");
++                break;
++            }
++
++            /* determine full path */
++            snprintf(full_path, sizeof(full_path), QIPS_SOCKETS_PATH "/%s",
++                     event->name);
++
++            DPRINTF("event name=%s mask=0x%x\n", event->name, event->mask);
++
++            if (event->mask & IN_CREATE) {
++                if (event->mask & IN_ISDIR) {
++                    DPRINTF("detected new directory: %s\n", full_path);
++                } else {
++                    pthread_t thread_id;
++                    char *path = g_malloc0(PATH_MAX);
++
++                    DPRINTF("detected new file: %s\n", full_path);
++
++                    pstrcpy(path, PATH_MAX, full_path);
++
++                    pthread_create(&thread_id, NULL, client_add_thread, path);
++                }
++            } else if (event->mask & IN_DELETE) {
++                if (event->mask & IN_ISDIR) {
++                    DPRINTF("detected deleted directory: %s\n", full_path);
++                } else {
++                    /* allow socket code to handle client removal */
++                    DPRINTF("detected deleted file: %s\n", full_path);
++                }
++            }
++        }
++    }
++
++    /* cleanup */
++    inotify_rm_watch(fd, wd);
++    close(fd);
++}
++
++static void client_scan(QipsState * s)
++{
++    struct dirent **namelist;
++    int i, ndev;
++
++    ndev = scandir(QIPS_SOCKETS_PATH, &namelist, is_domain_socket, alphasort);
++
++    if (ndev <= 0) {
++        return;
++    }
++
++    DPRINTF("checking client qemu sockets...\n");
++
++    for (i = 0; i < ndev; i++) {
++        pthread_t thread_id;
++        char *path = g_malloc0(PATH_MAX);
++        snprintf(path, PATH_MAX, "%s/%s", QIPS_SOCKETS_PATH,
++                 namelist[i]->d_name);
++
++        pthread_create(&thread_id, NULL, client_add_thread, path);
++
++        free(namelist[i]);
++    }
++}
++
++int main(int argc, char *argv[])
++{
++    int i;
++    QipsClient *dom0;
++
++#ifdef DO_LOG_SYSLOG
++    openlog("qips", LOG_CONS | LOG_PID, LOG_USER);
++#endif
++
++    DPRINTF("main entry...\n");
++
++    for (i = 1; i < argc && argv[i]; i++) {
++        if (strcmp(argv[i], "debug-evdev") == 0) {
++            DPRINTF("evdev_debug_mode = 1\n");
++            evdev_debug_mode = 1;
++        }
++        if (strcmp(argv[i], "debug-input") == 0) {
++            DPRINTF("input_backend_debug_mode = 1\n");
++            input_backend_debug_mode = 1;
++        }
++        if (strcmp(argv[i], "debug-qips") == 0) {
++            DPRINTF("qips_debug_mode = 1\n");
++            qips_debug_mode = 1;
++        }
++    }
++
++    state.console_frontend = xengt_console_frontend_register();
++    state.console_backend = vt_console_backend_register();
++    state.input_backend = evdev_input_backend_register();
++
++    setup_signals();
++
++    client_list_mutex_init(&state);
++
++    /* add dom0 to client list */
++    dom0 = g_malloc0(sizeof(QipsClient));
++    dom0->socket_fd = -1;
++    dom0->domain_id = 0;
++    dom0->slot_id = 0;
++    strcpy(dom0->socket_path, "dom0");
++
++    QTAILQ_INIT(&state.clients);
++
++    client_list_add(&state, dom0);
++
++    state.focused_client = QTAILQ_FIRST(&state.clients);
++
++    /* modules init after state is initialized */
++    state.console_frontend->init();
++    state.console_backend->init();
++    state.input_backend->init();
++
++    client_scan(&state);
++
++    while (1) {
++        client_notify(&state);
++    }
++
++    DPRINTF("exiting...\n");
++
++    qips_cleanup(&state);
++
++    return 0;
++}
+diff --git a/tools/qemu-xen/qips/qips.h b/tools/qemu-xen/qips/qips.h
+new file mode 100644
+index 0000000..5810f19
+--- /dev/null
++++ b/tools/qemu-xen/qips/qips.h
+@@ -0,0 +1,46 @@
++/*
++ * Copyright (c) 2013 Chris Patterson <cjp256@gmail.com>
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License as
++ * published by the Free Software Foundation; either version 2 or
++ * (at your option) version 3 of the License.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, see <http://www.gnu.org/licenses/>.
++ */
++#ifndef QIPS_H
++#define QIPS_H
++
++#include <syslog.h>
++
++extern int qips_debug_mode;
++
++#define DO_LOG_SYSLOG
++//#define DO_LOG_STDERR
++
++#ifdef DO_LOG_SYSLOG
++#define DPRINTF_SYSLOG(msg, ...) do syslog(LOG_NOTICE, "%s():L%d: " msg, \
++            __FUNCTION__, __LINE__, ## __VA_ARGS__); while(0)
++#else
++#define DPRINTF_SYSLOG(msg, ...) do { } while(0)
++#endif
++
++#ifdef DO_LOG_STDERR
++#define DPRINTF_STDERR(msg, ...) do fprintf(stderr, "%s():L%d: " msg, \
++            __FUNCTION__, __LINE__, ## __VA_ARGS__); while(0)
++#else
++#define DPRINTF_STDERR(msg, ...) do { } while(0)
++#endif
++
++#define DPRINTF(msg, ...) if (qips_debug_mode) do { \
++    DPRINTF_SYSLOG(msg, ## __VA_ARGS__); \
++    DPRINTF_STDERR(msg, ## __VA_ARGS__); \
++} while(0)
++
++#endif                          /* QIPS_H */
+diff --git a/tools/qemu-xen/qmp-commands.hx b/tools/qemu-xen/qmp-commands.hx
+index 5c692d0..aae631b 100644
+--- a/tools/qemu-xen/qmp-commands.hx
++++ b/tools/qemu-xen/qmp-commands.hx
+@@ -2654,3 +2654,49 @@ EQMP
+         .args_type  = "",
+         .mhandler.cmd_new = qmp_marshal_input_query_target,
+     },
++
++    {
++        .name       = "send-keycode",
++        .args_type  = "keycode:i,released:b",
++        .mhandler.cmd_new = qmp_marshal_input_send_keycode,
++    },
++    {
++        .name       = "send-mouse-abs",
++        .args_type  = "x:i,y:i,z:i,buttons:O",
++        .mhandler.cmd_new = qmp_marshal_input_send_mouse_abs,
++    },
++    {
++        .name       = "send-mouse-rel",
++        .args_type  = "dx:i,dy:i,dz:i,buttons:O",
++        .mhandler.cmd_new = qmp_marshal_input_send_mouse_rel,
++    },
++    {
++        .name       = "send-kbd-reset",
++        .args_type  = "",
++        .mhandler.cmd_new = qmp_marshal_input_send_kbd_reset,
++    },
++    {
++        .name       = "send-display-size",
++        .args_type  = "x:i,y:i",
++        .mhandler.cmd_new = qmp_marshal_input_send_display_size,
++    },
++    {
++        .name       = "send-mouse-scale",
++        .args_type  = "x:T,y:T",
++        .mhandler.cmd_new = qmp_marshal_input_send_mouse_scale,
++    },
++    {
++        .name       = "query-kbd-leds",
++        .args_type  = "",
++        .mhandler.cmd_new = qmp_marshal_input_query_kbd_leds,
++    },
++    {
++        .name       = "query-mouse-status",
++        .args_type  = "",
++        .mhandler.cmd_new = qmp_marshal_input_query_mouse_status,
++    },
++    {
++        .name       = "query-xen-status",
++        .args_type  = "",
++        .mhandler.cmd_new = qmp_marshal_input_query_xen_status,
++    },
+diff --git a/tools/qemu-xen/ui/Makefile.objs b/tools/qemu-xen/ui/Makefile.objs
+index adc07be..48a922f 100644
+--- a/tools/qemu-xen/ui/Makefile.objs
++++ b/tools/qemu-xen/ui/Makefile.objs
+@@ -12,3 +12,5 @@ common-obj-$(CONFIG_SDL) += sdl.o sdl_zoom.o x_keymap.o
+ common-obj-$(CONFIG_COCOA) += cocoa.o
+ common-obj-$(CONFIG_CURSES) += curses.o
+ common-obj-$(CONFIG_VNC) += $(vnc-obj-y)
++
++common-obj-y += qip.o
+diff --git a/tools/qemu-xen/ui/qip.c b/tools/qemu-xen/ui/qip.c
+new file mode 100644
+index 0000000..bd59999
+--- /dev/null
++++ b/tools/qemu-xen/ui/qip.c
+@@ -0,0 +1,434 @@
++/*
++ * Copyright (c) 2013 Chris Patterson <cjp256@gmail.com>
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License as
++ * published by the Free Software Foundation; either version 2 or
++ * (at your option) version 3 of the License.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, see <http://www.gnu.org/licenses/>.
++ */
++#include <stdint.h>
++#include <syslog.h>
++#include "qemu-thread.h"
++#include "qemu-common.h"
++#include "hw/xen.h"
++#include "ui/keymaps.h"
++#include "console.h"
++#include "qmp-commands.h"
++#include "ui/qip.h"
++#include "qemu-objects.h"
++
++//#define DO_LOG_SYSLOG
++//#define DO_LOG_STDERR
++
++#ifdef DO_LOG_SYSLOG
++#define DPRINTF_SYSLOG(msg, ...) do syslog(LOG_NOTICE, "%s():L%d: " msg, \
++            __FUNCTION__, __LINE__, ## __VA_ARGS__); while(0)
++#else
++#define DPRINTF_SYSLOG(msg, ...) do { } while(0)
++#endif
++
++#ifdef DO_LOG_STDERR
++#define DPRINTF_STDERR(msg, ...) do fprintf(stderr, "%s():L%d: " msg, \
++            __FUNCTION__, __LINE__, ## __VA_ARGS__); while(0)
++#else
++#define DPRINTF_STDERR(msg, ...) do { } while(0)
++#endif
++
++#define DPRINTF(msg, ...) if (qip_debug_mode) do { \
++    DPRINTF_SYSLOG(msg, ## __VA_ARGS__); \
++    DPRINTF_STDERR(msg, ## __VA_ARGS__); \
++} while(0)
++
++#define KEY_MAP_SIZE 256
++
++static int qip_debug_mode = 0;
++int using_qip = 0;
++
++typedef struct QipState {
++    /* display required for absolute devices & scaling */
++    int display_size_x;
++    int display_size_y;
++
++    /* scaling options for mouse inputs */
++    double mouse_scale_x;
++    double mouse_scale_y;
++
++    /* maintain mouse abs positioning coords */
++    int absolute_mouse_x;
++    int absolute_mouse_y;
++
++    /* listen for mouse mode changes */
++    Notifier mouse_mode_notifier;
++
++    /* track keyboard led state */
++    int kbd_led_state;
++
++    /* track key downs */
++    uint8_t key_down_map[KEY_MAP_SIZE];
++} QipState;
++
++static QipState qip_state = {
++    .display_size_x = 1920,
++    .display_size_y = 1200,
++    .mouse_scale_x = 1.0,
++    .mouse_scale_y = 1.0,
++    .absolute_mouse_x = 0,
++    .absolute_mouse_y = 0,
++    .mouse_mode_notifier = {},
++    .kbd_led_state = 0,
++    .key_down_map = {0,},
++};
++
++/* *INDENT-OFF* */
++static QemuOptsList qemu_qip_opts = {
++    .name = "qip",
++    .head = QTAILQ_HEAD_INITIALIZER(qemu_qip_opts.head),
++    .desc = {
++                {
++                .name = "debug",
++                .type = QEMU_OPT_NUMBER,
++                },
++                {
++                /* end of list */
++                }
++            },
++};
++/* *INDENT-ON* */
++
++/* send mouse mode event over qmp  */
++static void qip_qmp_mouse_mode_event(QipState * qss, int abs)
++{
++    QObject *mouse_status;
++
++    if (!qss) {
++        return;
++    }
++
++    qmp_marshal_input_query_mouse_status(NULL, NULL, &mouse_status);
++
++    monitor_protocol_event(QEVENT_QIP_MOUSE_MODE_UPDATE, mouse_status);
++}
++
++/* listener to detect changes between absolute/relative mouse */
++static void mouse_mode_notifier(Notifier * notifier, void *opaque)
++{
++    QipState *qss;
++
++    qss = container_of(opaque, QipState, mouse_mode_notifier);
++
++    DPRINTF("mouse is_absolute: %d\n", (int)kbd_mouse_is_absolute());
++
++    qip_qmp_mouse_mode_event(qss, kbd_mouse_is_absolute());
++}
++
++/* send mouse mode event over qmp  */
++static void qip_qmp_kbd_leds_event(QipState * qss)
++{
++    QObject *kbd_leds;
++
++    if (!qss) {
++        return;
++    }
++
++    qmp_marshal_input_query_kbd_leds(NULL, NULL, &kbd_leds);
++
++    monitor_protocol_event(QEVENT_QIP_KBD_LEDS_UPDATE, kbd_leds);
++}
++
++/* listener for led updates - send updates to server */
++static void kbd_leds(void *opaque, int ledstate)
++{
++    QipState *qss = (QipState *) opaque;
++
++    DPRINTF("kbd_leds(): ledstate=0x%x\n", ledstate);
++
++    qss->kbd_led_state = ledstate;
++
++    qip_qmp_kbd_leds_event(qss);
++}
++
++/* listener for gfx_switch to detect display changes */
++static void qip_gfx_switch(DisplayState * ds)
++{
++    if (ds) {
++        DPRINTF("old width=%d, height=%d\n",
++                qip_state.display_size_x, qip_state.display_size_y);
++        qip_state.display_size_x = ds_get_width(ds);
++        qip_state.display_size_y = ds_get_height(ds);
++        DPRINTF("new width=%d, height=%d\n",
++                qip_state.display_size_x, qip_state.display_size_y);
++    } else {
++        DPRINTF("iss_gfx_switch: nothing\n");
++    }
++}
++
++/* listener for requests to move cursor? */
++static void qip_mouse_set(DisplayState * ds, int x, int y, int on)
++{
++    DPRINTF("x=%d, y=%d, on=%d\n", x, y, on);
++}
++
++static struct DisplayChangeListener dcl_ops = {
++    .dpy_gfx_resize = qip_gfx_switch,
++    .dpy_mouse_set = qip_mouse_set,
++};
++
++/* process incoming keycode */
++void qmp_send_keycode(int64_t keycode, bool released, Error ** errp)
++{
++    QipState *qss = &qip_state;
++
++    if (keycode < 0 || keycode >= sizeof(qss->key_down_map)) {
++        DPRINTF("ignoring invalid keycode=0x%" PRId64 "x", keycode);
++        return;
++    }
++
++    if (released) {
++        if (qss->key_down_map[keycode] == 0) {
++            DPRINTF("ignoring invalid keyup event for keycode=0x%" PRId64 "x",
++                    keycode);
++        } else {
++            qss->key_down_map[keycode] = 0;
++
++            /* send keycode with extended code if grey */
++            if (keycode & SCANCODE_GREY) {
++                kbd_put_keycode(SCANCODE_EMUL0);
++            }
++            kbd_put_keycode(keycode | SCANCODE_UP);
++        }
++    } else {
++        if (keycode & SCANCODE_GREY) {
++            kbd_put_keycode(SCANCODE_EMUL0);
++        }
++        qss->key_down_map[keycode] = 1;
++        kbd_put_keycode(keycode & SCANCODE_KEYCODEMASK);
++    }
++}
++
++/* process incoming absolute mouse input */
++void qmp_send_mouse_abs(int64_t x, int64_t y, int64_t z, MouseButtons * buttons,
++                        Error ** errp)
++{
++    //QipState *qss = &qip_state;
++    int mb = 0;
++
++    if (buttons->left) {
++        mb |= MOUSE_EVENT_LBUTTON;
++    }
++    if (buttons->middle) {
++        mb |= MOUSE_EVENT_MBUTTON;
++    }
++    if (buttons->right) {
++        mb |= MOUSE_EVENT_RBUTTON;
++    }
++
++    DPRINTF("x=%" PRId64 "d, y=%" PRId64 "d, z=%" PRId64 "d buttons=0x%x\n",
++            x, y, z, mb);
++
++    /* handle the 'relatively' hard case - har har */
++    if (!kbd_mouse_is_absolute()) {
++        /* TODO: Convert abs to relative... */
++        DPRINTF("ignoring abs event as mouse is currently relative...\n");
++        return;
++    }
++
++    kbd_mouse_event(x, y, z, mb);
++}
++
++/* process incoming relative mouse input */
++void qmp_send_mouse_rel(int64_t dx, int64_t dy, int64_t dz,
++                        MouseButtons * buttons, Error ** errp)
++{
++    QipState *qss = &qip_state;
++    int mb = 0;
++
++    if (buttons->left) {
++        mb |= MOUSE_EVENT_LBUTTON;
++    }
++    if (buttons->middle) {
++        mb |= MOUSE_EVENT_MBUTTON;
++    }
++    if (buttons->right) {
++        mb |= MOUSE_EVENT_RBUTTON;
++    }
++
++    DPRINTF("dx=%" PRId64 "d, dy=%" PRId64 "d, dz=%" PRId64 "d buttons=0x%x\n",
++            dx, dy, dz, mb);
++
++    /* handle the 'relatively' simple case - har har */
++    if (!kbd_mouse_is_absolute()) {
++        kbd_mouse_event(dx, dy, dz, mb);
++        return;
++    }
++
++    /* convert relative to absolute */
++    DPRINTF("abs mouse: pre-correction x=%d\n", qss->absolute_mouse_x);
++    qss->absolute_mouse_x += (int)
++        (qss->mouse_scale_x * dx * 0x7FFF) / (qss->display_size_x - 1);
++
++    if (qss->absolute_mouse_x < 0) {
++        qss->absolute_mouse_x = 0;
++    } else if (qss->absolute_mouse_x > 0x7FFF) {
++        qss->absolute_mouse_x = 0x7FFF;
++    }
++    DPRINTF("abs mouse: post-correction x=%d\n", qss->absolute_mouse_x);
++
++    DPRINTF("abs mouse: pre-correction y=%d\n", qss->absolute_mouse_y);
++    qss->absolute_mouse_y += (int)
++        (qss->mouse_scale_y * dy * 0x7FFF) / (qss->display_size_y - 1);
++
++    if (qss->absolute_mouse_y < 0) {
++        qss->absolute_mouse_y = 0;
++    } else if (qss->absolute_mouse_y > 0x7FFF) {
++        qss->absolute_mouse_y = 0x7FFF;
++    }
++    DPRINTF("abs mouse: post-correction y=%d\n", qss->absolute_mouse_y);
++
++    //DPRINTF("abs mouse: pre-correction z=%d\n", qss->absolute_mouse_z);
++    //qss->absolute_mouse_z += dz;
++    //DPRINTF("abs mouse: post-correction z=%d\n", qss->absolute_mouse_z);
++
++    kbd_mouse_event(qss->absolute_mouse_x, qss->absolute_mouse_y, dz, mb);
++}
++
++/* process incoming keyboard reset request */
++void qmp_send_kbd_reset(Error ** errp)
++{
++    QipState *qss = &qip_state;
++    int i;
++
++    for (i = 0; i < sizeof(qss->key_down_map); i++) {
++        if (qss->key_down_map[i]) {
++            DPRINTF("reset key=%d (0x%x) up\n", i, i);
++
++            qss->key_down_map[i] = 0;
++
++            if (i & SCANCODE_GREY) {
++                kbd_put_keycode(SCANCODE_EMUL0);
++            }
++
++            kbd_put_keycode(i | SCANCODE_UP);
++        }
++    }
++}
++
++/* process incoming display size update */
++void qmp_send_display_size(int64_t x, int64_t y, Error ** errp)
++{
++    QipState *qss = &qip_state;
++
++    qss->display_size_x = x;
++    qss->display_size_y = y;
++}
++
++/* process incoming mouse scaler update */
++void qmp_send_mouse_scale(double x, double y, Error ** errp)
++{
++    QipState *qss = &qip_state;
++
++    qss->mouse_scale_x = x;
++    qss->mouse_scale_y = y;
++}
++
++/* process incoming query for mouse status */
++MouseStatus *qmp_query_mouse_status(Error ** errp)
++{
++    QipState *qss = &qip_state;
++    MouseStatus *mouse_status;
++
++    mouse_status = g_malloc0(sizeof(*mouse_status));
++
++    mouse_status->absolute = kbd_mouse_is_absolute();
++    mouse_status->x = qss->absolute_mouse_x;
++    mouse_status->y = qss->absolute_mouse_y;
++
++    return mouse_status;
++}
++
++/* process incoming query for xen status */
++XenStatus *qmp_query_xen_status(Error ** errp)
++{
++    //QipState *qss = &qip_state;
++    XenStatus *xen_status;
++
++    xen_status = g_malloc0(sizeof(*xen_status));
++
++    if (xen_domid > 0) {
++        xen_status->xen = true;
++        xen_status->domain = (int64_t) xen_domid;
++    } else {
++        xen_status->xen = false;
++        xen_status->domain = -1;
++    }
++
++    return xen_status;
++}
++
++/* process incoming query for keyboard led status */
++KbdLedStatus *qmp_query_kbd_leds(Error ** errp)
++{
++    QipState *qss = &qip_state;
++    KbdLedStatus *led_status;
++
++    led_status = g_malloc0(sizeof(*led_status));
++
++    if (qss->kbd_led_state & QEMU_SCROLL_LOCK_LED) {
++        led_status->scroll = true;
++    }
++    if (qss->kbd_led_state & QEMU_CAPS_LOCK_LED) {
++        led_status->caps = true;
++    }
++    if (qss->kbd_led_state & QEMU_NUM_LOCK_LED) {
++        led_status->num = true;
++    }
++
++    return led_status;
++}
++
++/* qip initialization function */
++void qip_init(DisplayState * ds)
++{
++    QipState *qss = &qip_state;
++
++    QemuOpts *opts;
++
++#ifdef DO_LOG_SYSLOG
++    /* prep syslog if logging there... */
++    openlog("qemu", LOG_CONS | LOG_PID, LOG_USER);
++#endif
++
++    DPRINTF("entry\n");
++
++    opts = QTAILQ_FIRST(&qemu_qip_opts.head);
++
++    if (!opts) {
++        fprintf(stderr, "qip_init(): invalid opts\n");
++        exit(1);
++    }
++
++    qip_debug_mode = (int)qemu_opt_get_number(opts, "debug", 0);
++
++    register_displaychangelistener(ds, &dcl_ops);
++
++    qemu_add_led_event_handler(kbd_leds, qss);
++
++    qss->mouse_mode_notifier.notify = mouse_mode_notifier;
++    qemu_add_mouse_mode_change_notifier(&qss->mouse_mode_notifier);
++
++    DPRINTF("end\n");
++}
++
++static void qip_register_config(void)
++{
++    qemu_add_opts(&qemu_qip_opts);
++}
++
++machine_init(qip_register_config);
+diff --git a/tools/qemu-xen/ui/qip.h b/tools/qemu-xen/ui/qip.h
+new file mode 100644
+index 0000000..c575793
+--- /dev/null
++++ b/tools/qemu-xen/ui/qip.h
+@@ -0,0 +1,23 @@
++/*
++ * Copyright (c) 2013 Chris Patterson <cjp256@gmail.com>
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License as
++ * published by the Free Software Foundation; either version 2 or
++ * (at your option) version 3 of the License.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, see <http://www.gnu.org/licenses/>.
++ */
++#ifndef QEMU_QIP_H
++#define QEMU_QIP_H
++
++extern int using_qip;
++void qip_init(DisplayState * ds);
++
++#endif                          /* QEMU_QIP_H */
+diff --git a/tools/qemu-xen/vl.c b/tools/qemu-xen/vl.c
+index a3ab384..ae37fd5 100644
+--- a/tools/qemu-xen/vl.c
++++ b/tools/qemu-xen/vl.c
+@@ -170,6 +170,8 @@ int main(int argc, char **argv)
+ #include "ui/qemu-spice.h"
+ #include "qapi/string-input-visitor.h"
+ 
++#include "ui/qip.h"
++
+ //#define DEBUG_NET
+ //#define DEBUG_SLIRP
+ 
+@@ -3022,6 +3024,18 @@ int main(int argc, char **argv, char **envp)
+                         printf("Bad argument to echr\n");
+                     break;
+                 }
++            case QEMU_OPTION_qip:
++                olist = qemu_find_opts("qip");
++                if (!olist) {
++                    fprintf(stderr, "qip is not supported by this qemu build.\n");
++                    exit(1);
++                }
++                opts = qemu_opts_parse(olist, optarg, 0);
++                if (!opts) {
++                    exit(1);
++                }
++                using_qip = 1;
++                break;
+             case QEMU_OPTION_monitor:
+                 monitor_parse(optarg, "readline");
+                 default_monitor = 0;
+@@ -3955,6 +3969,10 @@ int main(int argc, char **argv, char **envp)
+     }
+ #endif
+ 
++    if (using_qip) {
++        qip_init(ds);
++    }
++
+     /* display setup */
+     text_consoles_set_display(ds);
+ 

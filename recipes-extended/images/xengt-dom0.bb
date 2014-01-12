@@ -27,6 +27,6 @@ IMAGE_INSTALL += " \
     "
 
 SYSLINUX_XEN_ARGS += " conring_size=4M dom0_mem=2048M"
-SYSLINUX_KERNEL_ARGS += " xen_vgt.hvm_boot_foreground=1"
+SYSLINUX_KERNEL_ARGS += " xen_vgt.hvm_boot_foreground=0"
 
 

@@ -1203,10 +1203,10 @@ index 0000000..91c44a8
 +qips-obj-y += evdev.o
 diff --git a/tools/qemu-xen/qips/input-backend/evdev.c b/tools/qemu-xen/qips/input-backend/evdev.c
 new file mode 100644
-index 0000000..e7cb179
+index 0000000..9112904
 --- /dev/null
 +++ b/tools/qemu-xen/qips/input-backend/evdev.c
-@@ -0,0 +1,1087 @@
+@@ -0,0 +1,1093 @@
 +/*
 + * Copyright (c) 2013 Chris Patterson <cjp256@gmail.com>
 + *
@@ -1967,7 +1967,7 @@ index 0000000..e7cb179
 +            EVDEV_DPRINTF("ev->value: KEY_REPEAT (%d)\n", ev->value);
 +            break;
 +        case 3:
-+            EVDEV_DPRINTF("ev->value: KEY_WTF (%d)\n", ev->value);
++            EVDEV_DPRINTF("ev->value: KEY_?? (%d)\n", ev->value);
 +            break;
 +        }
 +
@@ -2018,8 +2018,13 @@ index 0000000..e7cb179
 +            EVDEV_DPRINTF("code=0x%x -> scancode=0x%x\n", ev->code, scancode);
 +
 +            if (scancode) {
-+                qips_input_backend_key_event(timestamp_usec(ev->time),
-+                                             scancode, ev->value);
++                if (ev->value == 0) {
++                    qips_input_backend_key_event(timestamp_usec(ev->time),
++                                                 scancode, true);
++                } else {
++                    qips_input_backend_key_event(timestamp_usec(ev->time),
++                                                 scancode, false);
++                }
 +            }
 +        }
 +    } else if (ev->type == EV_MSC
@@ -2058,7 +2063,7 @@ index 0000000..e7cb179
 +        struct input_event ev_data[64];
 +        ssize_t bytes_read;
 +        int i;
-+        
++
 +        bytes_read = read(device->fd, &ev_data, sizeof(ev_data));
 +
 +        if (bytes_read < sizeof(struct input_event)) {
@@ -2090,7 +2095,8 @@ index 0000000..e7cb179
 +                process_event(ev);
 +            }
 +
-+            /* XXX: optimize to consolidate grouped data (e.g. sum relatives) */
++            /* XXX: optimize to consolidate obsolete/grouped data:
++             *  (e.g. sum relatives, only use last absolute pos, etc.) */
 +        }
 +    }
 +
@@ -2327,10 +2333,10 @@ index 0000000..2ac22fe
 +#endif
 diff --git a/tools/qemu-xen/qips/input-backend/input-backend.c b/tools/qemu-xen/qips/input-backend/input-backend.c
 new file mode 100644
-index 0000000..f826a99
+index 0000000..d310f58
 --- /dev/null
 +++ b/tools/qemu-xen/qips/input-backend/input-backend.c
-@@ -0,0 +1,150 @@
+@@ -0,0 +1,141 @@
 +/*
 + * Copyright (c) 2013 Chris Patterson <cjp256@gmail.com>
 + *
@@ -2396,24 +2402,14 @@ index 0000000..f826a99
 +}
 +#endif
 +
-+static void qips_input_backend_key_map(int scancode, int key_status)
++static void qips_input_backend_key_map(int scancode, bool released)
 +{
-+    switch (key_status) {
-+    case 0:
-+        INPUT_DPRINTF("KEY_RELEASED (%d)\n", scancode);
++    if (released) {
++        INPUT_DPRINTF("key up = 0x%x\n", scancode);
 +        key_down_map[scancode & SCANCODE_KEYMASK] = 0;
-+        break;
-+    case 1:
-+        INPUT_DPRINTF("KEY_DEPRESSED (%d)\n", scancode);
++    } else {
++        INPUT_DPRINTF("key down = 0x%x\n", scancode);
 +        key_down_map[scancode & SCANCODE_KEYMASK] = 1;
-+        break;
-+    case 2:
-+        INPUT_DPRINTF("KEY_REPEAT (%d)\n", scancode);
-+        key_down_map[scancode & SCANCODE_KEYMASK] = 1;
-+        break;
-+    case 3:
-+        DPRINTF("KEY_WTF (%d)\n", scancode);
-+        return;
 +    }
 +
 +    /* Check magic keys (left ctrl + left alt + left/right) */
@@ -2431,17 +2427,18 @@ index 0000000..f826a99
 +}
 +
 +void qips_input_backend_key_event(int64_t timestamp_usec,
-+                                  int scancode, int key_status)
++                                  int scancode, bool released)
 +{
 +    char buf[1024];
 +
 +    snprintf(buf, sizeof(buf),
-+             "{ \"execute\": \"send-keycode\", \"arguments\": { \"keycode\": %d, \"released\": %s } }\r\n",
-+             scancode, (key_status == 0) ? "true" : "false");
++             "{ \"execute\": \"send-keycode\","
++             " \"arguments\": { \"keycode\": %d, \"released\": %s } }\r\n",
++             scancode, released ? "true" : "false");
 +
 +    qips_send_focused_client_message(buf, strlen(buf), false);
 +
-+    qips_input_backend_key_map(scancode, key_status);
++    qips_input_backend_key_map(scancode, released);
 +}
 +
 +void qips_input_backend_abs_mouse_event(int64_t timestamp_usec,
@@ -2483,7 +2480,7 @@ index 0000000..f826a99
 +}
 diff --git a/tools/qemu-xen/qips/input-backend/input-backend.h b/tools/qemu-xen/qips/input-backend/input-backend.h
 new file mode 100644
-index 0000000..e30ebdd
+index 0000000..624836e
 --- /dev/null
 +++ b/tools/qemu-xen/qips/input-backend/input-backend.h
 @@ -0,0 +1,65 @@
@@ -2532,7 +2529,7 @@ index 0000000..e30ebdd
 +bool qips_input_backend_cleanup(void);
 +
 +void qips_input_backend_key_event(int64_t timestamp_usec,
-+                                  int scancode, int key_status);
++                                  int scancode, bool released);
 +
 +void qips_input_backend_abs_mouse_event(int64_t timestamp_usec,
 +                                        int x, int y, int z,

@@ -34744,7 +34744,7 @@ index 0000000..6c2bf04
 +#define ASSERT_VM(x, vgt)						\
 +	do {								\
 +		if (!(x)) {						\
-+			printk("Assert at %s line %d\n",		\
++			break; printk("Assert at %s line %d\n",		\
 +				__FILE__, __LINE__);			\
 +			if (atomic_cmpxchg(&(vgt)->crashing, 0, 1))	\
 +				break;					\
